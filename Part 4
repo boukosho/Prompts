@@ -1,0 +1,711 @@
+SECTION 1 — IDENTITY, ROLE & DOCTRINE
+1.1 — Your Role
+You are a senior full-stack engineer continuing to build the EvidenceLedger system. You have completed Part #1 (Session Initiation), Part #2 (Facility Operations), and Part #3 (Contextual Delay Events — revised, replacing the retired Exclusion Rule Engine). You are now building Part #4: Session Rules.
+Part #4 is the system’s legal continuity firewall. It enforces the invariant that EvidenceLedger’s sessions are discrete, atomic, non-overlapping, non-mergeable evidence containers. Without these rules, a malicious facility or software bug could construct false narratives of continuous presence, merge events from distinct visits, or artificially extend sessions to evade timeout constraints. Part #4 makes these attacks STRUCTURALLY IMPOSSIBLE — not merely discouraged.
+1.2 — Active Doctrines (22 Total, 001–013 + 019–022)
+Doctrines 014–018 (old Exclusion Rule Engine) are permanently retired. The doctrines most relevant to Part #4 are:
+DOCTRINE-001: Event tables are STRICTLY append-only.
+DOCTRINE-002: All authoritative timestamps via database NOW() / NTP.
+DOCTRINE-004: No super-admin mutation paths.
+DOCTRINE-006: Session IDs are atomic, unique, non-mergeable.
+DOCTRINE-007: Every event is SHA-256 hashed and chain-linked.
+DOCTRINE-010: System-authority events bypass human roles entirely.
+DOCTRINE-013: Facility events do NOT change session status.
+DOCTRINE-022: EvidenceLedger DOES NOT COMPUTE (capstone doctrine).
+1.3 — New Doctrines Introduced in Part #4
+DOCTRINE-023: SESSION CLOSURE HIERARCHY IS STRICT
+  A session can close by EXACTLY ONE of three paths, in this priority order:
+    (1) CHECK_OUT by driver QR scan at exit — authority: DRIVER_CHECKOUT
+    (2) MANUAL_CLOSE by facility staff — authority: FACILITY_USER
+    (3) SESSION_TIMEOUT by system enforcement — authority: SYSTEM_TIMEOUT
+  Path (3) is LAST RESORT. It is used only when paths (1) and (2) fail.
+  A session cannot close by any other mechanism.
+  A session cannot close twice.
+
+DOCTRINE-024: SYSTEM_TIMEOUT MUST NEVER IMPLY CHECK_OUT
+  When the system forces a session closed due to max duration expiry,
+  this event records ONLY the fact of closure. It does NOT imply:
+    - That the driver/vehicle left the facility
+    - That work was completed
+    - That detention (if any) ended
+    - Any exit, departure, or physical egress
+  The closure is an evidentiary container boundary, nothing more.
+  Evidence packets must make this distinction explicit and prominent.
+
+DOCTRINE-025: SESSION MERGING IS STRUCTURALLY FORBIDDEN
+  No event can reference more than one session_id.
+  No database query, view, export, or API response may aggregate events
+  across session boundaries under a single ‘merged’ identity.
+  No system function accepts ‘merge session’ instructions.
+  Any attempt to violate this rule must: raise a database exception,
+  log an audit alert, and be rejected at the application layer.
+  Two sessions may be REFERENCED together externally (in reporting or
+  narration), but NEVER merged into a single evidence container.
+
+DOCTRINE-026: CONTINUED PRESENCE REQUIRES A NEW SESSION
+  If a driver remains physically on-site after a SESSION_TIMEOUT closure
+  (a ‘continued presence’ scenario), the ONLY valid paths forward are:
+    (A) Driver re-scans facility QR → creates NEW session (preferred)
+    (B) Facility records CONTINUED_PRESENCE → creates NEW session
+  Neither path reopens the original session. Neither path merges
+  evidence. Each new session has its own Session ID, own hash chain,
+  own evidence packet. Legal continuity fraud is technically blocked.
+
+DOCTRINE-027: FORCED-CLOSE FOR OVERLAP IS A SYSTEM DECISION, NOT A USER CHOICE
+  When a check-in attempt reveals an existing OPEN session for the same
+  (driver_token + facility_id), the system must take exactly ONE of
+  two actions, based on facility configuration:
+    (A) REJECT the new check-in and surface the existing session to the driver
+    (B) FORCE-CLOSE the existing session with SYSTEM_AUTHORITY,
+        record the reason as ‘FORCED_CLOSE_ON_NEW_CHECKIN’,
+        THEN create the new session
+  The choice between (A) and (B) is a per-facility policy setting made
+  by facility admins during facility onboarding. It is NOT a decision
+  made at runtime by a driver or staff member.
+⚠ LLM INSTRUCTION
+Before writing ANY code for Part #4, internalize DOCTRINE-024 above all others. The single most dangerous bug in this module would be allowing SESSION_TIMEOUT to be conflated with CHECK_OUT in any UI, report, export, or evidence packet. A driver stuck in a yard for 49 hours due to facility incompetence must NEVER appear in the evidence record as having ‘exited’ at hour 48. If you see any code path, UI copy, or data structure that could be interpreted as a timeout implying departure — STOP and fix it immediately.
+
+
+SECTION 2 — SCHEMA EXTENSIONS (MIGRATION 004)
+Generate a NEW Supabase migration file (004_session_rules.sql). This migration extends existing tables and adds new ones to enforce Part #4’s doctrines.
+2.1 — Extend sessions: Max Duration & Closure Reason
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS
+  max_duration_minutes INTEGER NOT NULL DEFAULT 2880  -- 48h default
+  CHECK (max_duration_minutes BETWEEN 60 AND 4320);    -- 1h min, 72h max
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS
+  closure_reason TEXT CHECK (closure_reason IN (
+    'DRIVER_CHECKOUT',
+    'FACILITY_MANUAL_CLOSE',
+    'SYSTEM_TIMEOUT_MAX_DURATION',
+    'FORCED_CLOSE_ON_NEW_CHECKIN'
+  ));
+
+-- Timeout enforcement metadata
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS
+  timeout_warning_sent_at TIMESTAMPTZ;
+
+-- Index for efficient timeout scanning
+CREATE INDEX IF NOT EXISTS idx_sessions_open_opened_at
+  ON sessions (opened_at) WHERE status = 'OPEN';
+2.2 — Extend facilities: Overlap Policy & Default Duration
+ALTER TABLE facilities ADD COLUMN IF NOT EXISTS
+  overlap_policy TEXT NOT NULL DEFAULT 'REJECT'
+  CHECK (overlap_policy IN ('REJECT', 'FORCE_CLOSE'));
+
+ALTER TABLE facilities ADD COLUMN IF NOT EXISTS
+  default_max_duration_minutes INTEGER NOT NULL DEFAULT 2880
+  CHECK (default_max_duration_minutes BETWEEN 60 AND 4320);
+2.3 — Extend session_events: Add CONTINUED_PRESENCE Event Type
+ALTER TABLE session_events DROP CONSTRAINT session_events_event_type_check;
+ALTER TABLE session_events ADD CONSTRAINT session_events_event_type_check
+  CHECK (event_type IN (
+    'CHECK_IN', 'CHECK_OUT',
+    'FACILITY_CLAIM', 'DRIVER_NOTE',
+    'SESSION_CLOSE', 'SESSION_TIMEOUT',
+    'PAPERWORK_READY', 'FACILITY_NOTE', 'MANUAL_CLOSE',
+    'CONTEXT_EVENT',
+    'CONTINUED_PRESENCE',        -- NEW in Part #4
+    'SESSION_TIMEOUT_WARNING',   -- NEW in Part #4 (informational)
+    'FORCED_CLOSE_ON_OVERLAP'    -- NEW in Part #4
+  ));
+2.4 — New Table: session_merge_audit_log
+Records any attempted violation of DOCTRINE-025 (merge prohibition). This is a security audit trail — the presence of rows here is itself alarming.
+CREATE TABLE session_merge_audit_log (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  attempted_at    TIMESTAMPTZ DEFAULT NOW(),
+  attempted_by    UUID REFERENCES auth.users(id),
+  attempt_source  TEXT NOT NULL,  -- 'api', 'sql', 'trigger', 'export'
+  session_ids     UUID[] NOT NULL,
+  operation       TEXT NOT NULL,
+  rejected        BOOLEAN NOT NULL DEFAULT true,
+  rejection_reason TEXT NOT NULL,
+  raw_payload     JSONB
+);
+
+REVOKE UPDATE, DELETE ON session_merge_audit_log FROM authenticated, anon;
+-- INSERT is via SECURITY DEFINER functions only
+REVOKE INSERT ON session_merge_audit_log FROM authenticated, anon;
+
+ALTER TABLE session_merge_audit_log ENABLE ROW LEVEL SECURITY;
+-- Only platform admins (a new role, not facility admins) can read this table
+CREATE POLICY smal_select ON session_merge_audit_log FOR SELECT
+  USING (auth.jwt() ->> 'role' = 'platform_admin');
+2.5 — New Table: facility_timeout_config (Optional — Per-Session Overrides)
+Most facilities use the default_max_duration_minutes from the facilities table. This table exists to support rare cases where individual sessions need a different max duration (e.g., planned multi-day loading for specialized cargo).
+CREATE TABLE facility_timeout_config (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  facility_id     UUID REFERENCES facilities(id) NOT NULL,
+  config_label    TEXT NOT NULL,         -- e.g., 'Multi-Day Cargo'
+  max_duration_minutes INTEGER NOT NULL
+    CHECK (max_duration_minutes BETWEEN 60 AND 4320),
+  requires_justification BOOLEAN DEFAULT true,
+  created_by      UUID REFERENCES auth.users(id),
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  is_active       BOOLEAN DEFAULT true,
+  UNIQUE (facility_id, config_label)
+);
+
+REVOKE UPDATE, DELETE ON facility_timeout_config FROM authenticated, anon;
+2.6 — UPDATE the Session Status Transition Trigger
+The update_session_status() trigger from Parts #1/#2 must be extended to handle the new closure paths:
+CREATE OR REPLACE FUNCTION update_session_status()
+  RETURNS TRIGGER AS $$
+BEGIN
+  -- CHECK_OUT → normal driver exit
+  IF NEW.event_type = 'CHECK_OUT' THEN
+    UPDATE sessions SET
+      status = 'CLOSED',
+      closed_at = NEW.timestamp_utc,
+      closure_authority = 'DRIVER_CHECKOUT',
+      closure_reason = 'DRIVER_CHECKOUT'
+    WHERE id = NEW.session_id AND status = 'OPEN';
+
+  -- MANUAL_CLOSE → facility staff action
+  ELSIF NEW.event_type = 'MANUAL_CLOSE' THEN
+    UPDATE sessions SET
+      status = 'CLOSED',
+      closed_at = NEW.timestamp_utc,
+      closure_authority = 'FACILITY_USER',
+      closure_reason = 'FACILITY_MANUAL_CLOSE'
+    WHERE id = NEW.session_id AND status = 'OPEN';
+
+  -- SESSION_TIMEOUT → system enforcement, MAX_DURATION exhausted
+  ELSIF NEW.event_type = 'SESSION_TIMEOUT' THEN
+    UPDATE sessions SET
+      status = 'TIMED_OUT',      -- note: distinct from CLOSED
+      closed_at = NEW.timestamp_utc,
+      closure_authority = 'SYSTEM_TIMEOUT',
+      closure_reason = 'SYSTEM_TIMEOUT_MAX_DURATION'
+    WHERE id = NEW.session_id AND status = 'OPEN';
+
+  -- FORCED_CLOSE_ON_OVERLAP → system enforcement, new check-in collision
+  ELSIF NEW.event_type = 'FORCED_CLOSE_ON_OVERLAP' THEN
+    UPDATE sessions SET
+      status = 'TIMED_OUT',
+      closed_at = NEW.timestamp_utc,
+      closure_authority = 'SYSTEM_TIMEOUT',
+      closure_reason = 'FORCED_CLOSE_ON_NEW_CHECKIN'
+    WHERE id = NEW.session_id AND status = 'OPEN';
+
+  -- CHECK_IN, PAPERWORK_READY, DRIVER_NOTE, CONTEXT_EVENT, etc.
+  -- → DO NOT change session status
+  -- (DOCTRINE-013: facility events do not change status)
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+⚠ SCHEMA INVARIANT
+After generating migration 004, write verification queries proving:
+(1) sessions.max_duration_minutes cannot exceed 4320 (72 hours).
+(2) sessions.closure_reason is NULL while status = 'OPEN', non-NULL otherwise.
+(3) The update_session_status trigger does NOT fire for: CHECK_IN, PAPERWORK_READY, DRIVER_NOTE, FACILITY_NOTE, CONTEXT_EVENT, CONTINUED_PRESENCE, SESSION_TIMEOUT_WARNING.
+(4) The trigger correctly routes CHECK_OUT to 'CLOSED' status, SESSION_TIMEOUT and FORCED_CLOSE_ON_OVERLAP to 'TIMED_OUT' status.
+(5) session_merge_audit_log cannot be INSERTed into by application roles directly.
+
+
+SECTION 3 — SESSION OVERLAP PREVENTION (handle-qr-scan UPDATE)
+The handle-qr-scan Edge Function from Part #1 already performs basic duplicate suppression (Step 3). Part #4 extends this logic to support the configurable overlap_policy per facility.
+3.1 — UPDATED Step 3 — Overlap Policy Resolution
+STEP 3 (UPDATED) — DUPLICATE/OVERLAP RESOLUTION
+
+3a. Query for existing OPEN session:
+    SELECT * FROM sessions
+    WHERE driver_token = [token]
+      AND facility_id = [facility_id]
+      AND status = 'OPEN'
+    LIMIT 1;
+
+3b. If no matching session → proceed to Step 4 (create new session).
+
+3c. If matching session exists, read the facility’s overlap_policy:
+    SELECT overlap_policy FROM facilities WHERE id = [facility_id];
+
+3d. IF overlap_policy = 'REJECT':
+    Return HTTP 409 with:
+    {
+      error: 'SESSION_ALREADY_OPEN',
+      existing_session_code: '...',
+      existing_opened_at: '...',
+      facility_policy: 'REJECT',
+      message: 'A session is already open for this driver at this facility.
+               Please close the existing session (CHECK_OUT) before
+               starting a new one.'
+    }
+
+3e. IF overlap_policy = 'FORCE_CLOSE':
+    Execute forced-close sequence:
+    - INSERT FORCED_CLOSE_ON_OVERLAP event into session_events for the
+      existing session. declared_by = 'SYSTEM'. timestamp_utc = NOW().
+      raw_payload = { reason: 'NEW_CHECKIN_ATTEMPTED',
+                      new_qr_id: [qr.id] }
+    - Compute event_hash, link to prev_event_hash
+    - The update_session_status trigger transitions the old session to
+      TIMED_OUT with closure_reason = 'FORCED_CLOSE_ON_NEW_CHECKIN'
+    - Proceed to Step 4 (create new session)
+    - In the response to the driver, include a disclosure:
+      {
+        prior_session_force_closed: true,
+        prior_session_code: '...',
+        prior_session_closure_reason: 'FORCED_CLOSE_ON_NEW_CHECKIN'
+      }
+⚠ DRIVER-FACING DISCLOSURE
+When the FORCE_CLOSE path is taken, the driver’s receipt (from Part #1) must prominently display: ‘Your prior session at this facility (S-XXXX) was force-closed by the system due to this new check-in. This is not an exit event for that session. Both sessions are preserved in the evidence record.’
+
+
+SECTION 4 — THE 48-HOUR HARD BOUNDARY (TIMEOUT ENFORCEMENT)
+4.1 — The Two-Phase Timeout Process
+For every OPEN session, the system runs two scheduled checks:
+•	WARNING PHASE at T = max_duration - 30 minutes: Record a SESSION_TIMEOUT_WARNING event (informational), and surface a non-blocking notification to the facility dashboard for that session.
+•	ENFORCEMENT PHASE at T = max_duration (the hard boundary): Record a SESSION_TIMEOUT event, which fires the status transition trigger to close the session with authority = SYSTEM_TIMEOUT.
+4.2 — Implementation: Supabase pg_cron + Edge Function
+Use Supabase’s built-in pg_cron extension to schedule a worker that runs every 1 minute. The worker invokes an Edge Function (or a SECURITY DEFINER database function) that:
+FUNCTION: session_timeout_enforcement_tick()
+SCHEDULE: every 1 minute via pg_cron
+RUNS AS: system_lifecycle_worker role (NOT a human role)
+
+STEP 1 — WARNING PHASE SCAN
+  Query sessions WHERE:
+    status = 'OPEN'
+    AND timeout_warning_sent_at IS NULL
+    AND opened_at <= (NOW() - (max_duration_minutes - 30) * INTERVAL '1 minute')
+
+  For each match:
+    (a) Compute prev_event_hash from most recent session_event
+    (b) INSERT SESSION_TIMEOUT_WARNING event:
+        - event_type: 'SESSION_TIMEOUT_WARNING'
+        - declared_by: 'SYSTEM'
+        - timestamp_utc: NOW()
+        - raw_payload: { warning_minutes_before_timeout: 30,
+                         scheduled_timeout_at: [session.opened_at +
+                         session.max_duration_minutes * INTERVAL '1 minute'] }
+        - Compute event_hash
+    (c) UPDATE sessions SET timeout_warning_sent_at = NOW() WHERE id = ...
+        (This UPDATE is permitted for the system_lifecycle_worker role only
+         on this specific column.)
+    (d) Publish a Supabase Realtime notification to the facility’s channel:
+        { type: 'SESSION_TIMEOUT_WARNING',
+          session_code, facility_id, scheduled_timeout_at }
+
+STEP 2 — ENFORCEMENT PHASE SCAN
+  Query sessions WHERE:
+    status = 'OPEN'
+    AND opened_at <= (NOW() - max_duration_minutes * INTERVAL '1 minute')
+
+  For each match:
+    (a) Compute prev_event_hash
+    (b) INSERT SESSION_TIMEOUT event:
+        - event_type: 'SESSION_TIMEOUT'
+        - declared_by: 'SYSTEM'
+        - timestamp_utc: NOW()
+        - raw_payload: {
+            reason: 'MAX_DURATION_REACHED',
+            max_duration_minutes: session.max_duration_minutes,
+            opened_at: session.opened_at,
+            disclaimer: 'This closure is an evidentiary container
+              boundary. It does NOT imply gate-out, work completion,
+              physical exit, or any determination of fault or detention.'
+          }
+        - Compute event_hash
+    (c) The update_session_status trigger automatically transitions
+        the session to status = 'TIMED_OUT'
+    (d) Publish Realtime notification:
+        { type: 'SESSION_TIMED_OUT',
+          session_code, facility_id, closed_at }
+4.3 — pg_cron Schedule
+-- Enable pg_cron extension (requires Supabase support)
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Schedule the timeout enforcement tick every 1 minute
+SELECT cron.schedule(
+  'session-timeout-enforcement',
+  '* * * * *',  -- every minute
+  $$ SELECT session_timeout_enforcement_tick(); $$
+);
+⚖ DOCTRINE-024 — THE TIMEOUT MESSAGE IS PARAMOUNT
+Every SESSION_TIMEOUT event MUST include the disclaimer in its raw_payload stating the closure is an evidentiary container boundary and does not imply gate-out, work completion, physical exit, or fault.
+
+Every UI element that displays a TIMED_OUT session must include visible language to this effect. Never use phrases like ‘session expired,’ ‘detention ended,’ ‘driver departed,’ or ‘timed out successfully.’ The correct phrasing is:
+
+• Dashboard badge: ‘TIMED OUT — Container closed, not exit’
+• Session detail header: ‘This session reached the maximum duration and was automatically closed. This closure does not indicate the driver or vehicle left the facility.’
+• Evidence packet: as specified in Section 6 below.
+
+
+SECTION 5 — MERGE PREVENTION & AUDIT
+🚫 DOCTRINE-025 — THESE OPERATIONS ARE FORBIDDEN
+No SQL query, view, materialized view, Edge Function, API endpoint, export, or UI component may perform ANY of these operations:
+
+• Combine events from multiple session_ids into a single logical ‘session’ representation.
+• Accept a request payload containing a session_ids array for ‘merge,’ ‘consolidate,’ or ‘unify.’
+• Present two distinct sessions to a user or external system as a single continuous timeline with shared identity.
+• Produce an evidence packet whose session_id field contains more than one value.
+• Insert events with multiple session_id references (the session_id column is NOT NULL and scalar — structurally impossible).
+
+Two sessions MAY be displayed ADJACENTLY in a UI or report for the SAME driver/facility, provided they have distinct Session IDs, distinct hash chains, and distinct evidence packets, with clear visual separation and labels.
+
+5.1 — Database-Level Enforcement
+-- Trigger that blocks any INSERT into session_events attempting to
+-- reference multiple session_ids (impossible by column type, but we
+-- add a defensive check for any column-level manipulation attempts)
+
+-- The session_events table already enforces session_id as a scalar UUID
+-- via FOREIGN KEY REFERENCES sessions(id). This is structurally sufficient.
+
+-- Additional audit trigger: log any UPDATE attempt on session_events,session_id
+CREATE OR REPLACE FUNCTION log_session_id_tampering_attempt()
+  RETURNS TRIGGER AS $$
+BEGIN
+  IF OLD.session_id IS DISTINCT FROM NEW.session_id THEN
+    -- This should be impossible because UPDATE is revoked, but log it
+    -- defensively in case of privilege escalation
+    INSERT INTO session_merge_audit_log (
+      attempted_by, attempt_source, session_ids,
+      operation, rejected, rejection_reason
+    ) VALUES (
+      (SELECT auth.uid()), 'sql_update',
+      ARRAY[OLD.session_id, NEW.session_id], 'session_id_change',
+      true, 'Session ID reassignment is forbidden (DOCTRINE-025)'
+    );
+    RAISE EXCEPTION
+      'DOCTRINE-025 VIOLATION: Session ID reassignment forbidden';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER trg_block_session_id_change
+  BEFORE UPDATE ON session_events
+  FOR EACH ROW
+  EXECUTE FUNCTION log_session_id_tampering_attempt();
+5.2 — Application-Level Enforcement
+Every Edge Function that accepts a session_code or session_id as input must validate that it is a single scalar value. Any request payload containing a session_ids array (plural) must be rejected with HTTP 400 and logged to session_merge_audit_log.
+5.3 — Export-Level Enforcement
+The evidence packet generator (Part #1, extended in #2 and #3) must enforce: one packet = one session. If a user requests an ‘evidence packet’ for multiple sessions, the system must produce MULTIPLE separate packets (zipped together for convenience) — never a single combined packet. Each packet must have its own packet_hash and session_hash.
+
+SECTION 6 — EVIDENCE PACKET UPDATES
+6.1 — Section 3 (Event Record) — New Event Types to Render
+The evidence packet’s Section 3 must render the following new event types:
+### Event Entry — SESSION_TIMEOUT_WARNING (informational)
+- Event ID: EVT-0xx
+- Event Type: SESSION_TIMEOUT_WARNING
+- Declared By: System
+- Authority: SYSTEM
+- Timestamp (UTC): 10:17:42
+- Trigger: System notification that session will close in 30 minutes
+- Character: Informational only; no state change
+
+### Event Entry — SESSION_TIMEOUT
+- Event ID: EVT-0xx
+- Event Type: SESSION_TIMEOUT
+- Declared By: System
+- Authority: SYSTEM (SYSTEM_TIMEOUT)
+- Timestamp (UTC): 10:47:42
+- Trigger: Maximum session duration (48h) elapsed
+- Reason: MAX_DURATION_REACHED
+- SYSTEM NOTICE (mandatory language per DOCTRINE-024):
+  "This closure is an evidentiary container boundary. It does NOT
+   imply that the driver or vehicle left the facility, that work
+   was completed, or that detention (if any) ended. The session
+   reached the configured maximum duration and was automatically
+   closed to maintain evidence container discipline."
+- Resulting Status: TIMED_OUT (not CLOSED)
+
+### Event Entry — FORCED_CLOSE_ON_OVERLAP
+- Event ID: EVT-0xx
+- Event Type: FORCED_CLOSE_ON_OVERLAP
+- Declared By: System
+- Authority: SYSTEM
+- Timestamp (UTC): 11:03:09
+- Trigger: New check-in attempted by same driver at same facility
+- New Session Reference: S-EGW09-[new_session_code]
+- Character: Does NOT imply gate-out. The prior session is closed
+  because a new one replaced it under facility overlap policy.
+
+### Event Entry — CONTINUED_PRESENCE
+- Event ID: EVT-0xx
+- Event Type: CONTINUED_PRESENCE
+- Declared By: Facility (Authorized Role)
+- Authority: FACILITY_USER
+- Timestamp (UTC): 11:15:22
+- Trigger: Facility records that driver remained on-site after prior
+          session timeout
+- Prior Session Reference: S-EGW09-[prior_session_code]
+- Character: This is the first event of a NEW session (not a
+  continuation of the prior session). The prior session remains
+  closed and independently verifiable.
+6.2 — New Section: Session Closure Declaration
+Add a new sub-section within the evidence packet’s existing Section 5 (Current Session State) that explicitly declares the closure authority and reason:
+## 5. Current Session State (As of Last Recorded Event)
+
+- Session Status: TIMED_OUT
+- Evidence Container: CLOSED
+- Closure Event: EVT-0xx (SESSION_TIMEOUT)
+- Closure Authority: SYSTEM (SYSTEM_TIMEOUT)
+- Closure Reason: SYSTEM_TIMEOUT_MAX_DURATION
+- Closure Timestamp: 10:47:42 UTC
+
+### CLOSURE DECLARATION (mandatory):
+This session was closed by automatic system enforcement upon reaching
+the configured maximum session duration (48 hours, as set by the
+facility). This closure:
+
+  - Is NOT a CHECK_OUT event.
+  - Does NOT indicate the driver or vehicle left the facility.
+  - Does NOT indicate work was completed.
+  - Does NOT make any determination about detention, delay, or liability.
+  - Represents ONLY the closure of this evidentiary record container
+    to maintain session discipline and evidentiary integrity.
+
+If the driver remained on-site after this closure, that status is
+reflected in a SEPARATE session with a distinct Session ID and
+independent evidence packet.
+6.3 — Cross-Session References (NOT Merging)
+When an evidence packet’s session has related prior/subsequent sessions (e.g., FORCED_CLOSE_ON_OVERLAP referencing a new session, or CONTINUED_PRESENCE referencing a prior session), the evidence packet must include a ‘Related Sessions’ section:
+## 10. Related Sessions (Non-Merging Cross-References)
+
+The following sessions are chronologically adjacent to this one but are
+INDEPENDENT evidence containers with their own Session IDs, hash chains,
+and verifiable integrity. They are NOT merged with this session.
+
+### Prior Session (if any)
+- Session ID: S-EGW09-[prior]
+- Relationship: This session begins after the prior session’s
+  closure. Prior session was closed by: [SYSTEM_TIMEOUT / FORCED_CLOSE].
+- Verification: [hash of prior session]
+
+### Subsequent Session (if any)
+- Session ID: S-EGW09-[next]
+- Relationship: The subsequent session began after this session’s
+  closure. Subsequent session reason: [CONTINUED_PRESENCE / NEW_CHECKIN].
+- Verification: [hash of subsequent session]
+
+### Notice
+EvidenceLedger does NOT infer continuity between these sessions.
+External parties evaluating time on-site across multiple sessions must
+do so using the raw timestamps from each session’s authoritative events.
+
+SECTION 7 — FACILITY DASHBOARD UI ADDITIONS
+7.1 — ActiveSessionRow Component Updates
+Every OPEN session row in the Active Sessions View (Part #2) must now display:
+•	Elapsed time counter (live): format as ‘47h 28m’ (hours + minutes, updated every 30 seconds).
+•	Max duration remaining indicator: progress bar or countdown showing how much time is left before SESSION_TIMEOUT fires.
+•	Color coding of the elapsed counter: green (< 50% of max), amber (50%-87.5%), red (> 87.5%, i.e., within the 30-minute warning window).
+•	Warning banner on the row if timeout_warning_sent_at is set: ‘This session will automatically close at [HH:MM UTC]. This will not record an exit.’
+7.2 — New Component: ContinuedPresenceButton
+Facility staff, when viewing a session that has status = TIMED_OUT with closure_reason = SYSTEM_TIMEOUT_MAX_DURATION, may see a ‘Record Continued Presence’ button. This button is only shown if no NEW session has already been started for this driver at this facility.
+// Component: ContinuedPresenceButton
+// Visible when:
+//   - Prior session: status = TIMED_OUT, closure_reason = SYSTEM_TIMEOUT_MAX_DURATION
+//   - No new OPEN session exists for the same (driver_token + facility_id)
+// Disabled if:
+//   - The session closed more than 4 hours ago (business rule: if the
+//     driver is still on-site 4 hours after a timeout with no new session,
+//     something is wrong — require driver re-scan instead)
+
+// On click: confirmation modal:
+//   'Record that driver remains on-site after the session timed out?
+//    This creates a NEW session with its own Session ID. The prior
+//    session remains closed and is not modified. You will be asked to
+//    provide a brief justification.'
+//   Required: justification text field (max 500 chars)
+//   [Cancel] [Record Continued Presence]
+
+// On confirm: call handle-continued-presence Edge Function
+7.3 — Edge Function: handle-continued-presence
+INPUT: {
+  prior_session_code: string,
+  justification: string,
+  // Auth: Supabase Auth JWT (admin or staff role required)
+}
+
+STEP 1 — AUTH (admin or staff)
+
+STEP 2 — VALIDATE PRIOR SESSION
+  - Look up prior session by code
+  - Verify status = 'TIMED_OUT'
+  - Verify closure_reason = 'SYSTEM_TIMEOUT_MAX_DURATION'
+  - Verify closure was less than 4 hours ago
+  - Verify no existing OPEN session for same (driver_token, facility_id)
+
+STEP 3 — CREATE NEW SESSION
+  - Generate NEW session_code (distinct from prior)
+  - Insert new session:
+    driver_token: [inherited from prior],
+    facility_id: [inherited from prior],
+    status: 'OPEN',
+    opened_at: NOW(),
+    max_duration_minutes: [inherited from facility default or prior]
+
+STEP 4 — INSERT CONTINUED_PRESENCE EVENT (as first event of NEW session)
+  - event_type: 'CONTINUED_PRESENCE'
+  - declared_by: 'FACILITY_USER'
+  - timestamp_utc: NOW()
+  - prev_event_hash: NULL (first event of this session)
+  - raw_payload: {
+      prior_session_code: [prior_code],
+      prior_session_closed_at: [prior closed_at],
+      justification: [input.justification],
+      declared_by_user_id: auth.uid(),
+      notice: 'This is a new session. The prior session remains closed
+               and is not modified. These sessions are not merged.'
+    }
+  - Compute event_hash
+
+STEP 5 — RETURN CONFIRMATION
+  - Return {
+      success: true,
+      new_session_code: '...',
+      prior_session_code: '...',
+      message: 'New session created. The prior session remains closed.
+               These are two independent evidence containers.'
+    }
+7.4 — RelatedSessionsPanel Component
+In the Session History View, when viewing a session that has related sessions (predecessor or successor), display a ‘Related Sessions’ collapsible panel. Each related session is shown as a card with its session code, date range, closure reason, and a ‘View Evidence Packet’ button. The panel makes clear: ‘These sessions are independent evidence containers. EvidenceLedger does not merge or combine them.’
+
+SECTION 8 — FACILITY CONFIGURATION UI
+Admin-only settings panel for configuring facility-level session rules. Add this as a new tab in the Facility Dashboard sidebar: ‘Session Rules.’
+8.1 — Overlap Policy Selector
+// Component: OverlapPolicySelector
+// Label: 'When a driver with an OPEN session attempts a new check-in:'
+// Radio options:
+//   (*) REJECT — Block the new check-in. The driver must close the prior
+//               session first (recommended for most facilities).
+//   ( ) FORCE_CLOSE — Automatically close the prior session with SYSTEM
+//                     authority, then accept the new check-in (only
+//                     recommended for facilities with frequent
+//                     session-state-corruption issues).
+// Default: REJECT
+// Help text: 'Changing this setting affects future check-ins only.'
+8.2 — Default Max Duration Slider
+// Component: MaxDurationSlider
+// Label: 'Default maximum session duration:'
+// Range: 60 minutes (1h) to 4320 minutes (72h)
+// Default: 2880 (48h)
+// Display value: '48 hours' (with live update)
+// Help text: 'Sessions that reach this duration are automatically
+//             closed by the system. This closure does NOT imply the
+//             driver or vehicle left the facility — it is solely an
+//             evidentiary container boundary for the ledger.'
+8.3 — Audit Log View (Platform Admin Only)
+// Component: SessionMergeAuditLogView
+// Visibility: platform_admin role ONLY (not facility admin)
+// Displays entries from session_merge_audit_log table
+// Columns: attempted_at, attempted_by (email), attempt_source,
+//          session_ids, operation, rejection_reason
+// Sorting: attempted_at DESC (newest first)
+// Purpose: Security monitoring. The expected state is ZERO rows.
+//          Any rows here indicate attempted tampering.
+
+SECTION 9 — VERIFICATION PORTAL UPDATES
+The public verification portal (Part #1) must be updated to correctly render TIMED_OUT sessions and related-session cross-references:
+•	TIMED_OUT sessions: prominently display the closure authority and the mandatory ‘This is NOT an exit event’ language.
+•	Sessions with related cross-references: display a ‘Related Sessions’ section with links (but NO merging) — each related session link opens a separate verification view.
+•	Explicitly state: ‘EvidenceLedger does not combine sessions. Each session is independently verified via its own hash chain.’
+
+SECTION 10 — DESIGN SYSTEM ADDITIONS
+10.1 — New Status Badge: TIMED_OUT
+// StatusBadge component gains a new variant: TIMED_OUT
+// Visual: gold/amber background (#F9E79F), dark gold border (#B7950B),
+//         dark gold text color
+// Icon: Clock (Lucide)
+// Label: 'TIMED OUT'
+// Tooltip: 'Session closed by automatic system enforcement after
+//           reaching maximum duration. Not an exit event.'
+
+// Full StatusBadge color recap:
+//   OPEN      = green  (#27AE60)
+//   CLOSED    = navy   (#1B2A4A) — indicates driver CHECK_OUT
+//   TIMED_OUT = gold   (#B7950B) — indicates system enforcement
+10.2 — New Color Token
+--color-gold:       #B7950B   // TIMED_OUT state, enforcement indicators
+--color-gold-light: #F9E79F   // TIMED_OUT badge backgrounds
+10.3 — DurationProgressBar Component
+// Component: DurationProgressBar
+// Props: startedAt (Date), maxDurationMinutes (number)
+// Visual: horizontal progress bar with live updates
+// Color transitions:
+//   0-50%:     var(--color-green)
+//   50-87.5%:  var(--color-accent) (amber)
+//   87.5-100%: var(--color-red)
+// Label: '47h 28m of 48h' + 'Timeout in 32m' (live countdown)
+// When timeout_warning_sent_at is not null: pulse animation on bar
+
+SECTION 11 — FILE STRUCTURE (Part #4 Additions)
+// NEW files added in Part #4:
+
+src/components/facility/
+  ├── ContinuedPresenceButton.tsx
+  ├── ContinuedPresenceModal.tsx         // With justification input
+  ├── RelatedSessionsPanel.tsx
+  ├── SessionRulesConfigView.tsx         // Settings tab
+  ├── OverlapPolicySelector.tsx
+  └── MaxDurationSlider.tsx
+
+src/components/ui/
+  ├── DurationProgressBar.tsx            // Live countdown bar
+  └── TimeoutWarningBanner.tsx           // In-row timeout alert
+
+src/components/admin/                        // Platform admin only
+  └── SessionMergeAuditLogView.tsx
+
+src/lib/
+  └── session-timing-utils.ts            // Elapsed/remaining calcs
+
+supabase/migrations/
+  └── 004_session_rules.sql
+
+supabase/functions/
+  ├── handle-continued-presence/
+  │   └── index.ts
+  └── session-timeout-tick/              // Called by pg_cron
+      └── index.ts
+
+// UPDATED files:
+supabase/functions/handle-qr-scan/index.ts  // Overlap policy logic
+src/components/facility/ActiveSessionRow.tsx // Duration bar + warning
+src/components/ui/StatusBadge.tsx            // TIMED_OUT variant
+src/components/ui/EventTimeline.tsx          // New event type rendering
+
+SECTION 12 — DELIVERABLES CHECKLIST
+#	Deliverable	Doctrines	Type
+1	Migration SQL: 004_session_rules.sql (session/facility column additions, event type extension, merge audit table, timeout config table, updated trigger, pg_cron schedule, verification queries)	001-007, 023-027	NEW
+2	Edge Function: session-timeout-tick (pg_cron-invoked; warning + enforcement phases; SECURITY DEFINER)	010, 023, 024	NEW
+3	Edge Function: handle-continued-presence (auth, validation, new session creation, CONTINUED_PRESENCE event)	006, 025, 026	NEW
+4	Edge Function: handle-qr-scan UPDATED (overlap policy resolution, FORCE_CLOSE path, FORCED_CLOSE_ON_OVERLAP event)	006, 025, 027	EXTENDED
+5	DB Function: update_session_status() EXTENDED to handle SESSION_TIMEOUT, FORCED_CLOSE_ON_OVERLAP with correct status routing	013, 023	EXTENDED
+6	DB Function: log_session_id_tampering_attempt() trigger (defensive audit against session_id mutation)	001, 004, 025	NEW
+7	React: ContinuedPresenceButton + Modal with justification input	026	NEW
+8	React: RelatedSessionsPanel (cross-references without merging)	025	NEW
+9	React: SessionRulesConfigView (admin-only facility settings)	027	NEW
+10	React: OverlapPolicySelector (REJECT vs FORCE_CLOSE radio)	027	NEW
+11	React: MaxDurationSlider (1h-72h range, 48h default)	023, 024	NEW
+12	React: DurationProgressBar (live countdown with color transitions)	N/A (UI)	NEW
+13	React: TimeoutWarningBanner (in-row session warning)	024	NEW
+14	React: SessionMergeAuditLogView (platform admin only; expected to be empty)	025	NEW
+15	ActiveSessionRow EXTENDED with DurationProgressBar and timeout warning	N/A (UI)	EXTENDED
+16	StatusBadge EXTENDED with TIMED_OUT variant (gold color)	024	EXTENDED
+17	EventTimeline EXTENDED to render SESSION_TIMEOUT, SESSION_TIMEOUT_WARNING, FORCED_CLOSE_ON_OVERLAP, CONTINUED_PRESENCE	N/A (UI)	EXTENDED
+18	Evidence Packet EXTENDED: new event-type renderings, closure declaration section, Related Sessions section	024, 025, 026	EXTENDED
+19	Verification Portal EXTENDED: TIMED_OUT rendering, cross-reference navigation, anti-merge language	024, 025	EXTENDED
+20	Design Tokens: --color-gold, --color-gold-light added	Consistency	EXTENDED
+21	TypeScript types: ClosureReason enum, OverlapPolicy enum, ContinuedPresencePayload, TimeoutWarningPayload, RelatedSessionReference	Type safety	EXTENDED
+22	Utility: session-timing-utils.ts (elapsed minutes, remaining minutes, phase classification)	Computation	NEW
+
+⚠ FINAL DOCTRINE GATE — PART #4
+Before presenting any code, run this mental checklist:
+(1) Does ANY UI element, log message, or data structure conflate SESSION_TIMEOUT with CHECK_OUT? If yes → SEVERE VIOLATION of DOCTRINE-024. FIX IMMEDIATELY.
+(2) Can a session close by any mechanism other than CHECK_OUT, MANUAL_CLOSE, SESSION_TIMEOUT, or FORCED_CLOSE_ON_OVERLAP? If yes → FIX. (DOCTRINE-023)
+(3) Can a session re-open after closure (OPEN → CLOSED/TIMED_OUT → OPEN)? If yes → CATASTROPHIC VIOLATION. Must be structurally impossible.
+(4) Does any query, view, or export combine events from multiple session_ids into a single logical session? If yes → SEVERE VIOLATION of DOCTRINE-025.
+(5) Does CONTINUED_PRESENCE reopen the prior session instead of creating a new one? If yes → FIX. (DOCTRINE-026)
+(6) Is the FORCE_CLOSE vs REJECT decision made at runtime by a user? If yes → FIX. It must be a facility-level admin configuration. (DOCTRINE-027)
+(7) Does any hardcoded value of 48 hours exist in the codebase (not as a default, but as a fixed constant)? If yes → FIX. Must be configurable per facility within [60, 4320] minutes.
+(8) Does the evidence packet SESSION_TIMEOUT event include the mandatory disclaimer language? If no → FIX. (DOCTRINE-024)
+(9) Can a driver’s receipt from a FORCED_CLOSE scenario hide from them the fact that their prior session was force-closed? If yes → FIX. Disclosure is mandatory.
+(10) Is pg_cron configured to run session-timeout-tick every 1 minute? If no → FIX. The timeout enforcement depends on this.
+
+
+END OF PROMPT — PART #4: SESSION RULES
+This prompt, when given to a capable LLM with Parts #1, #2, and #3 (Revised) in context, should produce the complete, doctrine-compliant Session Rules module. The five new doctrines (023–027) close the most subtle legal-vulnerability surface in the entire system: the temptation to ‘fix’ awkward session boundaries by merging, reopening, or conflating them. By making these operations STRUCTURALLY IMPOSSIBLE — not merely forbidden — EvidenceLedger ensures that every evidence packet stands on its own, and every session boundary is a legally defensible line that cannot be crossed by accident or by malice.
