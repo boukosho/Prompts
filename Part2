@@ -1,0 +1,525 @@
+
+# THE part 2 of the PROMPT:
+SECTION 1 — IDENTITY, ROLE & CONTINUITY FROM PART #1 of the PROMPTS
+1.1 — Your Role
+You are a senior full-stack engineer continuing to build the EvidenceLedger system. You have already completed Part #1 (Session Initiation), which delivered: the full PostgreSQL schema (facilities, facility_qr_codes, sessions, session_events, evidence_packets), the handle-qr-scan Edge Function, the handle-driver-annotation Edge Function, the driver QR scanner, receipt card, annotation form, hash chain utilities, and the verification portal.
+You are now building Part #2: Facility Operations. This module adds facility-side event recording capabilities — specifically the PAPERWORK_READY event, the driver disagreement/conflict preservation pattern, and the Facility Dashboard sub-views that expose these capabilities to authenticated warehouse staff.
+1.2 — System Doctrine (Unchanged — Re-stated for Context Anchoring)
+All 10 doctrines from Part #1 remain in full force. For quick reference:
+DOCTRINE-001: Event tables are STRICTLY append-only. No UPDATE, no DELETE for app roles.
+DOCTRINE-002: All authoritative timestamps via database NOW() synchronized to NTP. Client timestamps NEVER authoritative.
+DOCTRINE-003: Drivers are unauthenticated. Short-lived server-issued tokens only.
+DOCTRINE-004: No ‘super admin’ mutation paths. No human can UPDATE/DELETE event records.
+DOCTRINE-005: system_lifecycle_worker role for automated retention expiry only.
+DOCTRINE-006: Session IDs are atomic, unique, non-mergeable. No overlapping sessions.
+DOCTRINE-007: Every event is SHA-256 hashed and chain-linked.
+DOCTRINE-008: QR codes identify location only. Authority enforced server-side.
+DOCTRINE-009: Driver annotations NEVER change session state, timestamps, or prior events.
+DOCTRINE-010: System-authority events bypass human roles entirely.
+1.3 — New Doctrines Introduced in Part #2
+DOCTRINE-011: Facility claims (PAPERWORK_READY, etc.) are DECLARATIONS, not PROOFS.
+  - They record what the facility ASSERTS, not what objectively occurred.
+  - The system labels them as facility-declared and makes NO inference about
+    detention, liability, fault, or whether the driver was actually served.
+
+DOCTRINE-012: Conflicts are PRESERVED, never RESOLVED by the system.
+  - When a driver disagrees with a facility claim, BOTH records coexist permanently.
+  - The system does not decide who is correct. It does not adjudicate.
+  - Both the facility claim and the driver disagreement remain visible in the
+    evidence packet, side by side, for external parties to evaluate.
+
+DOCTRINE-013: Facility events do NOT change session status.
+  - PAPERWORK_READY does not close the session.
+  - PAPERWORK_READY does not imply CHECK_OUT.
+  - Session closure requires: explicit CHECK_OUT scan, manual facility close,
+    or system timeout. NOTHING else.
+⚠ LLM INSTRUCTION
+Before writing ANY code for Part #2, re-read ALL 13 doctrines. After writing each file, verify compliance with every applicable doctrine. DOCTRINE-011 through DOCTRINE-013 are the critical new ones — violations are subtle and easy to introduce accidentally.
+
+
+SECTION 2 — SCHEMA EXTENSIONS (MIGRATION)
+Part #2 requires schema extensions to the existing Part #1 database. Generate a NEW Supabase migration file (002_facility_operations.sql) that builds on top of the Part #1 schema without modifying existing tables destructively.
+2.1 — Table: user_roles (New)
+This table enforces the Buyer/Admin vs. Warehouse Staff role separation within a facility account.
+CREATE TABLE user_roles (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID REFERENCES auth.users(id) NOT NULL,
+  facility_id     UUID REFERENCES facilities(id) NOT NULL,
+  role            TEXT NOT NULL CHECK (role IN ('admin', 'staff')),
+  invited_by      UUID REFERENCES auth.users(id),
+  invited_at      TIMESTAMPTZ DEFAULT NOW(),
+  is_active       BOOLEAN DEFAULT true,
+  UNIQUE(user_id, facility_id)  -- one role per facility per user
+);
+
+-- RLS: users can only see roles for their own facility
+ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
+CREATE POLICY user_roles_select ON user_roles FOR SELECT
+  USING (facility_id IN (
+    SELECT facility_id FROM user_roles WHERE user_id = auth.uid()
+  ));
+
+-- Only admins can INSERT (invite) new roles
+CREATE POLICY user_roles_insert ON user_roles FOR INSERT
+  WITH CHECK (
+    facility_id IN (
+      SELECT facility_id FROM user_roles
+      WHERE user_id = auth.uid() AND role = 'admin'
+    )
+  );
+2.2 — Extend session_events: New Event Types
+The session_events CHECK constraint from Part #1 must be updated to include new facility event types. Use ALTER TABLE to add the new allowed values:
+-- Drop and recreate the event_type CHECK constraint
+ALTER TABLE session_events DROP CONSTRAINT session_events_event_type_check;
+ALTER TABLE session_events ADD CONSTRAINT session_events_event_type_check
+  CHECK (event_type IN (
+    'CHECK_IN',
+    'CHECK_OUT',
+    'FACILITY_CLAIM',
+    'DRIVER_NOTE',
+    'SESSION_CLOSE',
+    'SESSION_TIMEOUT',
+    'PAPERWORK_READY',
+    'FACILITY_NOTE',
+    'MANUAL_CLOSE'
+  ));
+2.3 — Table: facility_claims (New — Denormalized Claim Index)
+This table provides a fast-lookup index of facility claims for dashboard rendering. It does NOT replace session_events — the event table remains the source of truth. This is a read-optimized projection.
+CREATE TABLE facility_claims (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id      UUID REFERENCES sessions(id) NOT NULL,
+  event_id        UUID REFERENCES session_events(id) NOT NULL UNIQUE,
+  claim_type      TEXT NOT NULL CHECK (claim_type IN ('PAPERWORK_READY','FACILITY_NOTE')),
+  declared_by_user UUID REFERENCES auth.users(id) NOT NULL,
+  facility_id     UUID REFERENCES facilities(id) NOT NULL,
+  timestamp_utc   TIMESTAMPTZ NOT NULL,
+  has_driver_disagreement BOOLEAN DEFAULT false,
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Populated by a trigger on session_events INSERT WHERE declared_by = 'FACILITY_USER'
+-- This table is append-only for application roles (no UPDATE, no DELETE)
+REVOKE UPDATE, DELETE ON facility_claims FROM authenticated, anon;
+
+-- has_driver_disagreement is updated ONLY by a trigger that fires when a
+-- DRIVER_NOTE referencing this claim's event_id is inserted.
+-- This is a system-level trigger, not a human-accessible mutation path.
+⚠ SCHEMA INVARIANT
+After generating migration 002, write a verification query proving: (1) No application role can UPDATE facility_claims directly, (2) The has_driver_disagreement flag is set ONLY by a system trigger on session_events, (3) PAPERWORK_READY events do NOT fire the session status transition trigger.
+
+
+SECTION 3 — THE PAPERWORK_READY EVENT (Core of Part #2)
+This is the central feature of Part #2. A facility staff member declares that paperwork is ready for a specific session. The system records this as an immutable, timestamped facility claim — nothing more.
+3.1 — Business Rules (Exhaustive)
+Rule	Specification
+Who can trigger it?	Only authenticated facility users with role = 'staff' or role = 'admin' for the session's facility. Verified via Supabase Auth + user_roles RLS.
+Session must be OPEN?	YES. PAPERWORK_READY can only be recorded against an OPEN session. If the session is CLOSED or TIMED_OUT, the Edge Function returns HTTP 409 Conflict.
+Can it be issued more than once?	NO. Only ONE PAPERWORK_READY event per session. If already exists, return HTTP 409 with message: 'Paperwork ready has already been declared for this session.' This prevents timestamp manipulation via re-declaration.
+Can it be recalled/undone?	NO. Once declared, the event is permanent. No recall, no correction, no deletion. The facility cannot retract this claim. (DOCTRINE-001, DOCTRINE-011)
+Does it close the session?	ABSOLUTELY NOT. The session remains OPEN. PAPERWORK_READY is a claim, not a session lifecycle event. (DOCTRINE-013)
+Does it prove paperwork was delivered?	NO. It records only that the facility DECLARED paperwork was ready. It does NOT assert the driver received it, saw it, or acknowledged it. (DOCTRINE-011)
+What inferences does the system make?	NONE. The system makes no inference about detention, delay, fault, liability, or service completion. It records the fact and labels the actor. (DOCTRINE-011)
+Timestamp authority?	Database NOW() only. NTP-verified. The facility user's device time is ignored entirely. (DOCTRINE-002)
+Hash chain impact?	YES. The event is hashed (SHA-256), chain-linked to the previous event in the session, and the session hash is updated. (DOCTRINE-007)
+
+3.2 — Edge Function: handle-paperwork-ready
+INPUT: {
+  session_code: string,
+  // Auth: Supabase Auth JWT in Authorization header
+}
+
+STEP 1 — AUTHENTICATE & AUTHORIZE
+  - Extract user from Supabase Auth JWT
+  - Query user_roles WHERE user_id = auth.uid()
+    AND facility_id = (SELECT facility_id FROM sessions WHERE session_code = input.session_code)
+    AND role IN ('admin', 'staff')
+    AND is_active = true
+  - If no matching role → return { error: 'UNAUTHORIZED', status: 403 }
+
+STEP 2 — VALIDATE SESSION STATE
+  - Look up session by session_code
+  - If not found → return { error: 'SESSION_NOT_FOUND', status: 404 }
+  - If session.status != 'OPEN' → return { error: 'SESSION_NOT_OPEN',
+    message: 'Cannot record paperwork ready for a closed or timed-out session.',
+    status: 409 }
+
+STEP 3 — DUPLICATE DECLARATION GUARD
+  - Query session_events WHERE session_id = session.id AND event_type = 'PAPERWORK_READY'
+  - If exists → return { error: 'ALREADY_DECLARED',
+    message: 'Paperwork ready has already been declared for this session.',
+    existing_event_code: '...',
+    declared_at: '...',
+    status: 409 }
+
+STEP 4 — GET PREVIOUS EVENT HASH
+  - Query the most recent session_event for this session (ORDER BY timestamp_utc DESC LIMIT 1)
+  - Extract its event_hash as prev_event_hash
+
+STEP 5 — RECORD THE EVENT
+  - Generate event_code (e.g., 'EVT-{sequential}')
+  - Build the event payload:
+    {
+      event_type: 'PAPERWORK_READY',
+      declared_by: 'FACILITY_USER',
+      session_id: session.id,
+      location_label: session.location_label (inherited from check-in)
+      connectivity: 'ONLINE',
+      gps_status: null,  // facility claims do not require GPS
+      annotation_text: null,
+      referenced_event_id: null,
+      receipt_issued: false,
+    }
+  - Compute event_hash = SHA-256(canonical JSON of payload + prev_event_hash)
+  - INSERT into session_events
+  - Trigger fires to populate facility_claims projection table
+
+STEP 6 — UPDATE SESSION HASH CHAIN
+  - Recompute session_hash = SHA-256(all event hashes in order)
+  - Update via the system trigger (not direct UPDATE)
+
+STEP 7 — RETURN CONFIRMATION
+  - Return {
+      success: true,
+      event_code: 'EVT-002',
+      event_type: 'PAPERWORK_READY',
+      recorded_at: '14:30:23 UTC',
+      session_code: 'S-EGW09-9F2A77C4',
+      session_status: 'OPEN',  // STILL OPEN — emphasize this in the response
+      message: 'Paperwork ready has been recorded. Session remains open.'
+    }
+⚠ DOCTRINE-013 GATE CHECK
+After implementing this Edge Function, verify: (1) The function does NOT call any session closure logic. (2) The function does NOT update sessions.status. (3) The function does NOT fire the session status transition trigger. (4) The response explicitly states the session remains OPEN.
+
+
+SECTION 4 — DRIVER DISAGREEMENT & CONFLICT PRESERVATION
+This section implements the most legally significant pattern in EvidenceLedger: when a driver disagrees with a facility claim, the system preserves BOTH statements without resolving the conflict.
+4.1 — The Disagreement Scenario (Exact Specification)
+This is the complete, step-by-step reality of what happens:
+Step A: A warehouse staff member presses the ‘Paperwork Ready’ button. The system creates a permanent PAPERWORK_READY event with the NTP-verified timestamp (e.g., 14:30:23 UTC). This record cannot be changed or deleted. It shows only what the facility says, not what is proven to be true.
+Step B: The driver disagrees. The driver is still waiting and believes the paperwork was NOT ready at that time. The driver adds an annotation via the annotation page (built in Part #1). A typical annotation: ‘Paperwork was not handed to me yet. Still waiting at the dock.’
+Step C: The driver’s DRIVER_NOTE event is recorded with referenced_event_id pointing to the PAPERWORK_READY event. This creates an explicit, auditable link between the claim and the disagreement.
+Step D: The facility does nothing else. It does not correct itself. It does not acknowledge the disagreement.
+Step E: The system keeps BOTH statements. The system does NOT decide who is right. The system does NOT fix the conflict. The system does NOT take sides. Both records remain visible forever, side by side.
+
+4.2 — Technical Implementation of Disagreement Linking
+The Part #1 annotation system already supports referenced_event_id. For Part #2, extend the annotation UI to enable explicit disagreement linking:
+•	When the driver views their annotation page and a PAPERWORK_READY event exists in the session, display a prominent banner: ‘The facility has declared paperwork ready at [timestamp]. Do you agree?’
+•	Provide two paths: (A) ‘I agree’ — no annotation needed, driver acknowledges silently. (B) ‘I disagree — add my note’ — opens the annotation form with referenced_event_id pre-filled to the PAPERWORK_READY event’s ID.
+•	The ‘I agree’ button does NOT create any event. Agreement is absence of disagreement. This prevents gaming where a facility pressures drivers to ‘confirm.’
+•	The annotation form must show the facility claim’s timestamp alongside the driver’s note for context.
+4.3 — System Trigger: Flag Disagreement
+-- When a DRIVER_NOTE is inserted that references a PAPERWORK_READY event,
+-- update the facility_claims projection table:
+
+CREATE OR REPLACE FUNCTION flag_driver_disagreement()
+  RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.event_type = 'DRIVER_NOTE' AND NEW.referenced_event_id IS NOT NULL THEN
+    UPDATE facility_claims
+      SET has_driver_disagreement = true
+      WHERE event_id = NEW.referenced_event_id;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER trg_flag_disagreement
+  AFTER INSERT ON session_events
+  FOR EACH ROW
+  EXECUTE FUNCTION flag_driver_disagreement();
+
+-- NOTE: This is the ONLY mutation of facility_claims.has_driver_disagreement.
+-- It is a system trigger, not a human-accessible path.
+-- DOCTRINE-012 is preserved: the system flags the conflict but does not resolve it.
+⚠ CONFLICT PRESERVATION INVARIANT
+Verify: (1) The system NEVER deletes the facility claim when a driver disagrees. (2) The system NEVER deletes the driver note. (3) The system NEVER modifies either record's content or timestamp. (4) The flag_driver_disagreement trigger ONLY sets has_driver_disagreement = true, never false. (5) There is NO ‘resolve conflict’ API endpoint, button, or mechanism anywhere in the system.
+
+
+SECTION 5 — FACILITY DASHBOARD: OPERATIONS SUB-VIEW
+The Facility Dashboard (built in Part #1 as a placeholder or stub) must now be extended with operational capabilities. The dashboard is accessible to authenticated facility users (both admin and staff roles, with role-specific permissions).
+5.1 — Dashboard Layout
+The Facility Dashboard must have a navigation sidebar or tab bar with the following sections:
+•	Active Sessions — all OPEN sessions at this facility (real-time, auto-refreshing).
+•	Session History — all CLOSED and TIMED_OUT sessions (searchable, filterable by date range, container, BOL).
+•	QR Management — generate and manage facility QR codes (built in Part #1).
+•	Evidence Packets — generate and view evidence packets (built in Part #1, extended here).
+•	Team Management — invite/manage team members (admin role only).
+5.2 — Active Sessions View (New)
+This is the primary working view for warehouse staff. Design and build it with the following specifications:
+•	Display a list/table of all OPEN sessions at the facility, sorted by check-in time (oldest first — longest-waiting driver at top).
+•	Each session row shows: session code (monospace), container number, BOL number, check-in timestamp, elapsed time since check-in (live counter, updated every 30 seconds), queue position, and current status badges.
+•	Each session row has an expandable detail panel showing the EventTimeline component (from Part #1) with all events in that session so far.
+•	Each OPEN session row has a ‘Paperwork Ready’ action button — prominent, teal-colored, with a clipboard/checkmark icon. This button is DISABLED (grayed out) if PAPERWORK_READY has already been declared for this session. If already declared, show the timestamp of the existing declaration instead of the button.
+•	Each OPEN session row has a ‘Close Session’ action button — secondary style, requires confirmation modal. Only staff or admin can use this.
+•	If a session has a driver disagreement (has_driver_disagreement = true in facility_claims), display a visible conflict indicator: an amber warning icon with tooltip ‘Driver has disputed a facility claim in this session.’
+•	Auto-refresh: the view should poll for updates every 30 seconds or use Supabase Realtime subscriptions.
+5.3 — Paperwork Ready Button — Interaction Flow
+When a warehouse staff member clicks the ‘Paperwork Ready’ button on an active session:
+•	Step 1: Show a confirmation modal: ‘You are declaring that paperwork is ready for session [SESSION_CODE] (Container: [CONTAINER], BOL: [BOL]). This action is permanent and cannot be undone. The timestamp will be recorded as [current UTC time preview]. Continue?’
+•	Step 2: On confirm, call the handle-paperwork-ready Edge Function with the session_code and the user’s Auth JWT.
+•	Step 3: On success, replace the button with a green checkmark and the recorded timestamp. Show a toast notification: ‘Paperwork ready recorded at [timestamp].’
+•	Step 4: On error (409 duplicate), show the existing declaration timestamp. On error (409 session not open), show an appropriate message. On error (403 unauthorized), redirect to login.
+•	Step 5: The EventTimeline in the expanded session detail updates to show the new PAPERWORK_READY event.
+5.4 — Manual Session Close — Interaction Flow
+When a facility user clicks ‘Close Session’:
+•	Show a confirmation modal: ‘You are manually closing session [SESSION_CODE]. This will record a MANUAL_CLOSE event. The session cannot be reopened. Continue?’
+•	Call a new Edge Function: handle-manual-close (see Section 6).
+•	On success, the session moves from Active Sessions to Session History.
+•	The closure authority is recorded as ‘FACILITY_USER’ with the authenticated user’s ID.
+
+SECTION 6 — EDGE FUNCTION: handle-manual-close
+INPUT: {
+  session_code: string,
+  // Auth: Supabase Auth JWT in Authorization header
+}
+
+STEP 1 — AUTHENTICATE & AUTHORIZE
+  - Same auth/role check as handle-paperwork-ready
+  - Require role = 'admin' or 'staff'
+
+STEP 2 — VALIDATE SESSION STATE
+  - Look up session by session_code
+  - If not found → return 404
+  - If session.status != 'OPEN' → return 409 'Session is already closed'
+
+STEP 3 — RECORD MANUAL_CLOSE EVENT
+  - Generate event_code
+  - Build event payload:
+    {
+      event_type: 'MANUAL_CLOSE',
+      declared_by: 'FACILITY_USER',
+      annotation_text: null,  // no reason required, but could be added later
+    }
+  - Compute event_hash, link to prev_event_hash
+  - INSERT into session_events
+
+STEP 4 — SESSION STATUS TRANSITION (via trigger)
+  - The INSERT into session_events fires the update_session_status() trigger
+  - The trigger detects event_type = 'MANUAL_CLOSE' and transitions:
+    sessions.status = 'CLOSED'
+    sessions.closed_at = NOW()
+    sessions.closure_authority = 'FACILITY_USER'
+  - This is the ONLY path that mutates sessions.status
+
+STEP 5 — UPDATE SESSION HASH CHAIN
+  - Recompute and update session_hash via trigger
+
+STEP 6 — RETURN CONFIRMATION
+  - Return {
+      success: true,
+      event_code: 'EVT-xxx',
+      session_code: 'S-EGW09-...',
+      new_status: 'CLOSED',
+      closed_at: '...',
+      closure_authority: 'FACILITY_USER'
+    }
+ℹ TRIGGER UPDATE REQUIRED
+The update_session_status() trigger from Part #1 must be EXTENDED to handle:
+event_type = 'MANUAL_CLOSE' → set status = 'CLOSED', closure_authority = 'FACILITY_USER'
+event_type = 'CHECK_OUT'    → set status = 'CLOSED', closure_authority = 'DRIVER_CHECKOUT'
+event_type = 'SESSION_TIMEOUT' → set status = 'TIMED_OUT', closure_authority = 'SYSTEM_TIMEOUT'
+All other event types (CHECK_IN, PAPERWORK_READY, DRIVER_NOTE, FACILITY_NOTE, FACILITY_CLAIM) → DO NOTHING to session status.
+
+
+SECTION 7 — EVIDENCE PACKET EXTENSION FOR PART #2 EVENTS
+The evidence packet generator from Part #1 must be extended to correctly render Part #2 events. Specifically:
+7.1 — PAPERWORK_READY in the Evidence Packet
+When a session’s evidence packet includes a PAPERWORK_READY event, the packet’s Section 3 (Event Record) must render it with the following structure:
+### Event Entry
+
+- Event ID: EVT-002
+- Event Type: PAPERWORK_READY
+- Declared By: Facility (Authorized Role)
+- Trigger: Facility declaration that work is completed and paperwork is ready
+- Timestamp (UTC): [recorded value]
+- Time Authority: External Network Time Protocol (NTP) – Verified
+- Connectivity Status: Online
+- Event Characteristics:
+    - Single timestamp
+    - No recall issued
+    - No correction issued
+    - No disagreement recorded at time of entry
+- Event Integrity:
+    - Event cryptographically hashed
+    - Event appended to session ledger
+    - Event immutable once recorded
+7.2 — Driver Disagreement in the Evidence Packet
+When a DRIVER_NOTE references a PAPERWORK_READY event, the evidence packet must render BOTH records adjacently with clear labeling:
+### Event Entry — Facility Claim
+- Event ID: EVT-002
+- Event Type: PAPERWORK_READY
+- Declared By: Facility (Authorized Role)
+- Timestamp (UTC): 14:30:23
+- [full event details as above]
+
+### Event Entry — Driver Disagreement (Annotation)
+- Event ID: EVT-003
+- Event Type: DRIVER_NOTE
+- Captured By: Driver (Unauthenticated, no PII)
+- Authority: Driver Annotation
+- Timestamp (UTC): 14:31:02
+- Referenced Event: EVT-002
+- Annotation (verbatim):
+  "Paperwork was not handed to me yet. Still waiting at the dock."
+
+### Conflict Status
+- The facility’s claim and the driver’s disagreement are both preserved.
+- The system has not resolved this conflict.
+- Both records are presented for external evaluation.
+7.3 — Updated Section 6 (Evidentiary Scope and Limitations)
+When a PAPERWORK_READY event is present, the evidence packet’s Section 6 must include:
+This Ledger Evidence Packet records only the following factual assertion:
+  - The facility declared that paperwork was ready at the recorded time.
+
+This record does NOT:
+  - Assert that paperwork was physically handed to the driver
+  - Prove completion beyond the facility’s declaration
+  - Assign liability or fault
+  - Calculate detention or delay
+  - Resolve or anticipate disputes
+
+All interpretations are reserved for external parties.
+
+SECTION 8 — UI/UX DESIGN SPECIFICATIONS
+All components must use the design system from Part #1 (design-tokens.css). The following are new component specifications for Part #2.
+8.1 — PaperworkReadyButton Component
+// States:
+// 1. AVAILABLE: Teal button with clipboard-check icon. Label: 'Paperwork Ready'
+// 2. LOADING:   Teal button with spinner. Label: 'Recording...'
+// 3. DECLARED:  Green background with checkmark. Label: 'Declared at 14:30 UTC'
+// 4. DISABLED:  Gray, non-interactive. Shown when session is not OPEN.
+
+// Visual:
+// - Width: full-width within the session row action area
+// - Height: 44px (touch-friendly)
+// - Border-radius: var(--radius-md)
+// - Font: var(--font-body), 14px, bold
+// - Icon: 20px, left-aligned within button
+// - Transition: 200ms ease-out on background-color and opacity
+8.2 — ActiveSessionRow Component
+// Layout: horizontal card with left info block and right action block
+// Left block:
+//   - Session code (var(--font-mono), 14px, color-navy)
+//   - Container + BOL (var(--font-body), 13px, color-gray)
+//   - Check-in time (var(--font-mono), 12px, color-gray)
+//   - Elapsed time badge (live counter, amber if > 2hrs, red if > 4hrs)
+// Right block:
+//   - PaperworkReadyButton
+//   - CloseSessionButton (secondary style, smaller)
+// Bottom:
+//   - Expandable EventTimeline (collapsed by default, expand on click)
+// Conflict indicator:
+//   - If has_driver_disagreement: amber triangle icon + tooltip in header
+//   - Position: top-right corner of the card
+8.3 — ConfirmationModal Component
+// Shared confirmation modal used by Paperwork Ready and Close Session
+// Overlay: semi-transparent dark backdrop (rgba(0,0,0,0.5))
+// Modal: white card, var(--radius-lg), var(--shadow-elevated)
+// Header: action title in var(--font-display), 20px, color-navy
+// Body: description text with session details in bold
+// Footer: two buttons — Cancel (ghost style) and Confirm (primary style)
+// For destructive actions (Close Session): Confirm button is red
+// For recording actions (Paperwork Ready): Confirm button is teal
+// Animation: fade in + scale from 95% to 100%, 200ms ease-out
+8.4 — ConflictIndicator Component
+// Visual: amber warning triangle icon (from Lucide: AlertTriangle)
+// Size: 20px
+// Tooltip on hover: 'Driver has disputed a facility claim in this session.'
+// Placement: top-right corner of session row
+// Animation: subtle pulse (opacity 0.7 to 1.0, 2s infinite) to draw attention
+8.5 — DisagreementBanner Component (Driver-Side)
+// Shown on the driver annotation page when PAPERWORK_READY exists in session
+// Layout: full-width banner at top of annotation form
+// Background: var(--color-light) with left border 4px var(--color-accent)
+// Content:
+//   Icon: Info circle (Lucide: Info)
+//   Title: 'Facility Claim Recorded' (bold, color-navy)
+//   Body: 'The facility declared paperwork ready at [TIME]. Do you agree?'
+//   Buttons:
+//     'I agree' (ghost/secondary, does NOTHING — no event created)
+//     'I disagree — add my note' (primary, scrolls to annotation form,
+//       auto-fills referenced_event_id)
+// CRITICAL: 'I agree' does NOT create an event. Agreement = silence.
+
+SECTION 9 — UPDATED ROUTING
+Add the following routes to the React Router configuration from Part #1:
+Route	Page/Component	Auth Required
+/facility/sessions/active	ActiveSessionsView	Supabase Auth (staff or admin)
+/facility/sessions/history	SessionHistoryView	Supabase Auth (staff or admin)
+/facility/team	TeamManagementView	Supabase Auth (admin only)
+
+
+SECTION 10 — SESSION HISTORY VIEW
+The Session History view displays all CLOSED and TIMED_OUT sessions for the facility. Design and build it:
+•	Filterable by: date range (date picker), container number (text search), BOL number (text search), closure authority (dropdown: FACILITY_USER, DRIVER_CHECKOUT, SYSTEM_TIMEOUT, ALL).
+•	Sortable by: check-in time, closed-at time, session duration (calculated as closed_at - opened_at).
+•	Each row shows: session code, container, BOL, check-in time, close time, duration, closure authority badge, conflict indicator (if applicable).
+•	Each row is expandable to show the full EventTimeline and a ‘Generate Evidence Packet’ button (admin role only).
+•	Pagination: 25 sessions per page, with total count displayed.
+•	Export: ‘Export to CSV’ button that exports the filtered/sorted list as a CSV file (session data only, not full events).
+
+SECTION 11 — TEAM MANAGEMENT VIEW
+Admin-only view for managing facility team members.
+•	Display all users with roles at this facility: name, email, role (admin/staff), invited date, active status.
+•	Invite button: opens a modal to enter email address and select role. Generates a temporary dynamic invite link (24-hour expiry). Maximum 30 active users per facility.
+•	Admin can deactivate (not delete) a team member. Deactivated users cannot log in or perform actions but their historical actions remain attributed correctly in the ledger.
+•	Admin can change a user’s role between admin and staff. This is a user_roles UPDATE (allowed for this table, as it is NOT an event table).
+
+SECTION 12 — FILE STRUCTURE (Part #2 Additions)
+// NEW files added in Part #2 (additions to Part #1 tree):
+
+src/components/facility/
+  ├── ActiveSessionsView.tsx       // Main operational view
+  ├── ActiveSessionRow.tsx         // Individual session row
+  ├── PaperworkReadyButton.tsx     // Stateful action button
+  ├── CloseSessionButton.tsx       // Manual close action
+  ├── ConfirmationModal.tsx        // Shared confirm dialog
+  ├── ConflictIndicator.tsx        // Amber warning badge
+  ├── SessionHistoryView.tsx       // Closed sessions archive
+  ├── SessionFilters.tsx           // Filter/sort controls
+  ├── TeamManagementView.tsx       // Admin team management
+  ├── InviteMemberModal.tsx        // Invite flow
+  └── FacilityNavSidebar.tsx       // Dashboard navigation
+
+src/components/driver/
+  └── DisagreementBanner.tsx       // Facility claim awareness banner
+
+supabase/migrations/
+  └── 002_facility_operations.sql  // Part #2 schema extension
+
+supabase/functions/
+  ├── handle-paperwork-ready/
+  │   └── index.ts
+  └── handle-manual-close/
+      └── index.ts
+
+SECTION 13 — DELIVERABLES CHECKLIST
+When you are finished, verify that you have produced ALL of the following. If any item is missing, go back and complete it.
+#	Deliverable	Doctrines	New/Extended
+1	Migration SQL: 002_facility_operations.sql (user_roles, facility_claims, constraint updates, triggers, RLS)	001,002,011-013	NEW
+2	Edge Function: handle-paperwork-ready (auth, validation, duplicate guard, hash chain, NO session closure)	001,002,007,011,013	NEW
+3	Edge Function: handle-manual-close (auth, validation, status transition via trigger)	001,002,004,007,010	NEW
+4	Trigger: flag_driver_disagreement (system trigger on DRIVER_NOTE referencing facility claims)	001,004,012	NEW
+5	Trigger: update_session_status() EXTENDED to handle MANUAL_CLOSE, CHECK_OUT, SESSION_TIMEOUT, and IGNORE other event types	010,013	EXTENDED
+6	React: ActiveSessionsView (real-time session list with action buttons)	N/A (UI)	NEW
+7	React: ActiveSessionRow (session card with PaperworkReady + Close + conflict indicator)	N/A (UI)	NEW
+8	React: PaperworkReadyButton (4-state button: available, loading, declared, disabled)	N/A (UI)	NEW
+9	React: ConfirmationModal (shared modal for destructive/recording actions)	N/A (UI)	NEW
+10	React: ConflictIndicator (amber warning with tooltip)	012 (UI)	NEW
+11	React: DisagreementBanner (driver-side awareness of facility claims)	009,011,012	NEW
+12	React: SessionHistoryView (filtered/sorted archive with CSV export)	N/A (UI)	NEW
+13	React: TeamManagementView (admin-only user/role management)	N/A (UI)	NEW
+14	React: FacilityNavSidebar (dashboard navigation)	N/A (UI)	NEW
+15	Evidence Packet Generator: EXTENDED to render PAPERWORK_READY events + driver disagreements + updated Section 6 limitations	007,011,012	EXTENDED
+16	TypeScript types: new interfaces for FacilityClaim, UserRole, ManualClosePayload, PaperworkReadyPayload	Type safety	EXTENDED
+
+⚠ FINAL DOCTRINE GATE — PART #2
+Before presenting any code, run this mental checklist:
+(1) Does PAPERWORK_READY close or alter the session status in ANY way? If yes → FIX. (DOCTRINE-013)
+(2) Does the system resolve, adjudicate, or remove ANY conflict between facility claims and driver notes? If yes → FIX. (DOCTRINE-012)
+(3) Does any facility claim assert truth beyond what the facility declared? If yes → FIX. (DOCTRINE-011)
+(4) Can any application role UPDATE the facility_claims table directly? If yes → FIX. (DOCTRINE-001/004)
+(5) Is every new event (PAPERWORK_READY, MANUAL_CLOSE, FACILITY_NOTE) hashed and chain-linked? If no → FIX. (DOCTRINE-007)
+(6) Does the ‘I agree’ button on the DisagreementBanner create any event or record? If yes → FIX. (Agreement = silence.)
+
+
