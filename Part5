@@ -1,0 +1,800 @@
+SECTION 1 — IDENTITY, ROLE & DOCTRINE
+1.1 — Your Role
+You are a senior full-stack engineer completing the EvidenceLedger system. You have built Part #1 (Session Initiation), Part #2 (Facility Operations), Part #3 (Contextual Delay Events — the revised Part #3, replacing the retired Exclusion Rule Engine), and Part #4 (Session Rules: closure hierarchy, overlap prevention, merge prohibition, 48-hour hard boundary). You are now building Part #5: Data Retention & Post-Platform Life.
+Part #5 governs the evidence lifecycle after creation. It makes two seemingly contradictory guarantees work together: (1) detailed records are permanently deleted after a fixed retention window, to respect privacy and compliance; (2) cryptographic proof of the evidence’s prior existence is preserved indefinitely, so that previously-exported Evidence Packets remain verifiable forever — even when EvidenceLedger is offline, defunct, or no longer trusted.
+This module is the reason EvidenceLedger is legally defensible in the long term: a court in 2035 evaluating a PDF from 2024 must be able to verify its integrity without ever contacting us.
+1.2 — Active Doctrines (27 Total: 001–013, 019–027)
+Doctrines 014–018 are permanently retired (Exclusion Rule Engine). The doctrines most relevant to Part #5:
+DOCTRINE-001: Event tables are STRICTLY append-only.
+DOCTRINE-004: No super-admin mutation paths. No human role can UPDATE/DELETE event records.
+DOCTRINE-005: system_lifecycle_worker role exists for automated retention expiry only.
+  → Not accessible to any human user. Policy-defined SQL conditions only.
+DOCTRINE-007: Every event is SHA-256 hashed and chain-linked.
+DOCTRINE-010: System-authority events bypass human roles entirely.
+DOCTRINE-022: EvidenceLedger DOES NOT COMPUTE — capstone doctrine.
+1.3 — New Doctrines Introduced in Part #5
+DOCTRINE-028: RETENTION IS TIME-BOUND, POLICY-ENFORCED, AND NON-REVERSIBLE
+  When a retention window expires for an Evidence Packet:
+    - All detailed raw records (events, metadata, device info, connectivity)
+      are PERMANENTLY DELETED by automated policy.
+    - This is: time-bound, non-discretionary, non-reversible, no human approval.
+    - There is NO mechanism to extend, pause, override, or restore deleted data.
+  The retention window is configurable per facility (within system limits)
+  but once data is deleted, it is GONE — even for the facility that owned it.
+
+DOCTRINE-029: PROOF-OF-EXISTENCE SURVIVES CONTENT DELETION
+  After retention expiry, the system retains EXCLUSIVELY:
+    - The cryptographic hash of the complete Evidence Packet
+    - The hash chain linking packets to maintain structural integrity
+    - Minimal tombstone metadata (packet_code, expiry date, retention policy ID)
+  NOTHING else survives:
+    - No event content. No timestamps (beyond tombstone creation). No actors.
+    - No annotations. No facility claims. No contextual events. No sessions.
+  The system can answer ONE question after expiry:
+    ‘Did an Evidence Packet with this exact hash exist, unchanged, at that time?’
+  It cannot answer any other question.
+
+DOCTRINE-030: EXPORTED EVIDENCE IS THE AUTHORITATIVE CONTENT CARRIER
+  Human-readable evidence content (timelines, events, narratives) lives in the
+  EXPORTED Evidence Packet (PDF), NOT in the platform after retention expiry.
+  Therefore:
+    - Evidence Packets must be exportable as self-contained PDF artifacts.
+    - PDFs must embed the hash, verification instructions, and a complete
+      human-readable record of all events in the session.
+    - PDFs must be readable and verifiable WITHOUT network access.
+    - PDFs must survive EvidenceLedger being offline, sold, or dissolved.
+
+DOCTRINE-031: HASH ANCHORING ENABLES PLATFORM-ABSENT VERIFICATION
+  For an Evidence Packet to remain verifiable when EvidenceLedger is absent,
+  its hash must be ANCHORED to an independent, platform-external source.
+  EvidenceLedger provides multiple anchoring mechanisms:
+    (A) Public hash registry — published periodically (e.g., daily digest)
+        as a static, versioned JSON file at a well-known URL.
+    (B) Third-party publishing — facility exports their own copy of packet
+        hashes for publication on their domain / compliance records.
+    (C) Optional blockchain anchoring — where required by regulation or
+        customer contract (NOT default; configurable and opt-in).
+  At least one anchoring method MUST be active for every generated
+  Evidence Packet before retention expiry.
+
+DOCTRINE-032: POST-EXPIRY, THE SYSTEM IS A PASSIVE VERIFIER ONLY
+  After retention expiry, EvidenceLedger’s operational role is reduced to:
+    - Accepting a hash as input
+    - Looking it up in the tombstone table
+    - Returning a binary yes/no: ‘This hash was registered in our system
+      prior to its retention expiry on DATE.’
+  It CANNOT:
+    - Reconstruct events, timelines, or any content
+    - Provide additional metadata beyond the tombstone
+    - Modify, reissue, or re-interpret anything
+    - Accept requests to ‘recover’ expired data
+
+DOCTRINE-033: EVIDENCELEDGER REMOVES ITSELF FROM THE TRUST CHAIN
+  The system is architecturally designed to become UNNECESSARY after evidence
+  creation. A court in 2040 evaluating a PDF from 2025 should be able to
+  verify it using ONLY:
+    (1) The PDF itself
+    (2) A hash, independently published in 2025 (via anchoring)
+    (3) Standard SHA-256 tooling (openssl, sha256sum, built-in OS tools)
+  No EvidenceLedger contact, access, or trust is required for verification.
+  This is the system’s ULTIMATE value proposition.
+⚠ LLM INSTRUCTION
+DOCTRINE-033 is the final piece of EvidenceLedger’s identity. Every line of code in Part #5 must move the system CLOSER to being dispensable, not more indispensable. If you find yourself writing logic that REQUIRES EvidenceLedger to be online for verification to work — STOP. You are building lock-in, not evidence. The correct architecture makes EvidenceLedger helpful but optional for verification.
+
+
+SECTION 2 — SCHEMA EXTENSIONS (MIGRATION 005)
+Generate a NEW Supabase migration file (005_retention_and_tombstones.sql). This migration adds retention policy configuration, the tombstone table, and the hash registry. It does NOT modify existing evidence_packets — the retention worker will handle their transformation.
+2.1 — New Table: retention_policies
+CREATE TABLE retention_policies (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  facility_id     UUID REFERENCES facilities(id) NOT NULL,
+  retention_months INTEGER NOT NULL
+    CHECK (retention_months BETWEEN 6 AND 120),  -- 6 months to 10 years
+  effective_from  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  effective_until TIMESTAMPTZ,                    -- NULL if still active
+  configured_by   UUID REFERENCES auth.users(id) NOT NULL,
+  configuration_reason TEXT,                      -- optional admin note
+  superseded_by   UUID REFERENCES retention_policies(id),
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- One active policy per facility at any time enforced via partial unique index
+CREATE UNIQUE INDEX idx_retention_policies_active_per_facility
+  ON retention_policies (facility_id) WHERE effective_until IS NULL;
+
+-- Policies are versioned. Changes create new rows; old policies preserved.
+-- Application roles can INSERT (via Edge Function) but never UPDATE existing
+-- effective rows. The 'supersede' operation is a SECURITY DEFINER function.
+REVOKE UPDATE, DELETE ON retention_policies FROM authenticated, anon;
+
+ALTER TABLE retention_policies ENABLE ROW LEVEL SECURITY;
+CREATE POLICY rp_select ON retention_policies FOR SELECT
+  USING (facility_id IN (
+    SELECT facility_id FROM user_roles WHERE user_id = auth.uid()
+  ));
+2.2 — New Table: evidence_tombstones (Post-Expiry Hash Registry)
+The tombstone table is the SOLE survivor of retention expiry. It preserves proof-of-existence without preserving content. Each row corresponds to an Evidence Packet whose detailed records have been deleted.
+CREATE TABLE evidence_tombstones (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  packet_code     TEXT UNIQUE NOT NULL,     -- e.g., 'EP-EGW09-S0001'
+
+  -- The hash(es) this tombstone verifies
+  packet_hash     TEXT NOT NULL,            -- SHA-256 of the complete packet
+  session_hash    TEXT NOT NULL,            -- SHA-256 of the session chain
+  pdf_hash        TEXT,                     -- SHA-256 of exported PDF, if any
+
+  -- Minimal preservation metadata (NO CONTENT)
+  facility_id     UUID REFERENCES facilities(id),
+  original_created_at TIMESTAMPTZ NOT NULL, -- when the packet was generated
+  retention_expired_at TIMESTAMPTZ NOT NULL,-- when content was deleted
+  retention_policy_id UUID REFERENCES retention_policies(id) NOT NULL,
+  retention_months_at_deletion INTEGER NOT NULL,
+
+  -- Anchoring verification
+  anchoring_methods TEXT[] NOT NULL,        -- e.g., ['REGISTRY','THIRD_PARTY']
+  registry_digest_id UUID,                  -- ref to hash_registry_digests
+
+  -- Meta
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  tombstone_notice TEXT NOT NULL DEFAULT 
+    'Detailed records for this evidence packet have been deleted per retention policy. Only cryptographic proof of prior existence survives. No content reconstruction is possible.'
+);
+
+-- Tombstones are WRITE-ONCE, READ-FOREVER
+-- Only the retention worker can INSERT
+-- NOBODY can UPDATE or DELETE
+REVOKE INSERT, UPDATE, DELETE ON evidence_tombstones FROM authenticated, anon;
+
+-- Tombstones are PUBLICLY READABLE (this is the point of them)
+ALTER TABLE evidence_tombstones ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tombstones_public_select ON evidence_tombstones
+  FOR SELECT USING (true);
+
+CREATE INDEX idx_tombstones_packet_hash ON evidence_tombstones (packet_hash);
+CREATE INDEX idx_tombstones_session_hash ON evidence_tombstones (session_hash);
+CREATE INDEX idx_tombstones_pdf_hash ON evidence_tombstones (pdf_hash);
+2.3 — New Table: hash_registry_digests (Anchoring)
+A hash registry digest is a daily (or configurable-period) snapshot of all evidence packet hashes generated during that period. Digests are published to a well-known URL as static JSON, providing an immutable external anchor for verification.
+CREATE TABLE hash_registry_digests (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  digest_code     TEXT UNIQUE NOT NULL,    -- e.g., 'DIGEST-2025-01-15'
+  period_start    TIMESTAMPTZ NOT NULL,
+  period_end      TIMESTAMPTZ NOT NULL,
+  packet_count    INTEGER NOT NULL,
+
+  -- Merkle root of all packet hashes in this period
+  merkle_root     TEXT NOT NULL,
+
+  -- Full hash list (JSON array of {packet_code, packet_hash, generated_at})
+  hash_manifest   JSONB NOT NULL,
+
+  -- Self-integrity hash (SHA-256 of the entire digest content)
+  digest_hash     TEXT NOT NULL,
+
+  -- Publication metadata
+  published_at    TIMESTAMPTZ,              -- when file was written to storage
+  public_url      TEXT,                     -- where the static JSON lives
+
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  CHECK (period_end > period_start)
+);
+
+REVOKE INSERT, UPDATE, DELETE ON hash_registry_digests
+  FROM authenticated, anon;
+
+-- Publicly readable — the whole point is external verification
+ALTER TABLE hash_registry_digests ENABLE ROW LEVEL SECURITY;
+CREATE POLICY digests_public_select ON hash_registry_digests
+  FOR SELECT USING (true);
+
+CREATE INDEX idx_digests_period ON hash_registry_digests (period_start, period_end);
+2.4 — New Table: retention_audit_log
+Every retention expiry action is logged. This table proves what was deleted, when, under which policy, and how many records were affected. It is critical for compliance audits.
+CREATE TABLE retention_audit_log (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  operation_code  TEXT UNIQUE NOT NULL,    -- e.g., 'RET-2025-01-15-001'
+  executed_at     TIMESTAMPTZ DEFAULT NOW(),
+  retention_policy_id UUID REFERENCES retention_policies(id) NOT NULL,
+
+  -- Affected scope
+  facility_id     UUID REFERENCES facilities(id) NOT NULL,
+  packet_count_deleted INTEGER NOT NULL,
+  event_count_deleted INTEGER NOT NULL,
+  tombstone_count_created INTEGER NOT NULL,
+
+  -- Integrity verification
+  pre_operation_session_hash_chain TEXT NOT NULL,
+  post_operation_tombstone_digest  TEXT NOT NULL,
+
+  -- Detailed list of deleted packet codes (for audit trail)
+  deleted_packet_codes TEXT[] NOT NULL,
+
+  execution_duration_ms INTEGER NOT NULL,
+  executed_by_role TEXT NOT NULL DEFAULT 'system_lifecycle_worker'
+);
+
+REVOKE INSERT, UPDATE, DELETE ON retention_audit_log
+  FROM authenticated, anon;
+
+ALTER TABLE retention_audit_log ENABLE ROW LEVEL SECURITY;
+-- Facility admins can read their own audit entries
+CREATE POLICY ral_select_facility ON retention_audit_log FOR SELECT
+  USING (facility_id IN (
+    SELECT facility_id FROM user_roles
+    WHERE user_id = auth.uid() AND role = 'admin'
+  ));
+2.5 — Extend evidence_packets: Retention Metadata
+ALTER TABLE evidence_packets ADD COLUMN IF NOT EXISTS
+  retention_policy_id UUID REFERENCES retention_policies(id);
+
+ALTER TABLE evidence_packets ADD COLUMN IF NOT EXISTS
+  scheduled_expiry_at TIMESTAMPTZ;
+
+ALTER TABLE evidence_packets ADD COLUMN IF NOT EXISTS
+  last_exported_at TIMESTAMPTZ;
+
+ALTER TABLE evidence_packets ADD COLUMN IF NOT EXISTS
+  export_count INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_packets_scheduled_expiry
+  ON evidence_packets (scheduled_expiry_at) WHERE scheduled_expiry_at IS NOT NULL;
+⚠ SCHEMA INVARIANT
+After generating migration 005, write verification queries proving:
+(1) retention_policies cannot be UPDATED or DELETED by app roles.
+(2) evidence_tombstones cannot be INSERTED, UPDATED, or DELETED by app roles.
+(3) hash_registry_digests cannot be modified by app roles.
+(4) Only one retention_policy is active per facility at any time.
+(5) retention_months is constrained to [6, 120] months.
+(6) Tombstones are publicly readable via RLS.
+
+
+SECTION 3 — THE RETENTION EXPIRY WORKER
+The retention worker is a pg_cron-scheduled database function that runs daily. It identifies expired Evidence Packets, creates tombstones, and permanently deletes all associated detailed records. It runs as the system_lifecycle_worker role (DOCTRINE-005) — no human trigger is possible.
+3.1 — Function: retention_expiry_daily_tick()
+CREATE OR REPLACE FUNCTION retention_expiry_daily_tick()
+  RETURNS void AS $$
+DECLARE
+  v_packet RECORD;
+  v_policy RECORD;
+  v_start_time TIMESTAMPTZ;
+  v_session_id UUID;
+  v_event_count INTEGER;
+  v_operation_code TEXT;
+BEGIN
+  v_start_time := NOW();
+
+  -- Find all evidence packets whose scheduled_expiry_at <= NOW()
+  -- and whose session still has associated events (i.e., not already tombstoned)
+  FOR v_packet IN
+    SELECT ep.*, s.facility_id
+    FROM evidence_packets ep
+    JOIN sessions s ON s.id = ep.session_id
+    WHERE ep.scheduled_expiry_at <= NOW()
+      AND NOT EXISTS (
+        SELECT 1 FROM evidence_tombstones et WHERE et.packet_code = ep.packet_code
+      )
+  LOOP
+    -- Load the active retention policy for this facility
+    SELECT * INTO v_policy FROM retention_policies
+      WHERE facility_id = v_packet.facility_id
+        AND effective_until IS NULL
+      LIMIT 1;
+
+    v_session_id := v_packet.session_id;
+
+    -- Count events before deletion (for audit)
+    SELECT COUNT(*) INTO v_event_count
+      FROM session_events WHERE session_id = v_session_id;
+
+    -- STEP A: Generate unique operation code
+    v_operation_code := 'RET-' || to_char(NOW(), 'YYYY-MM-DD') || '-' ||
+                        to_char(EXTRACT(EPOCH FROM NOW()), 'FM999999');
+
+    -- STEP B: Create the tombstone BEFORE deleting anything
+    INSERT INTO evidence_tombstones (
+      packet_code, packet_hash, session_hash, pdf_hash,
+      facility_id, original_created_at, retention_expired_at,
+      retention_policy_id, retention_months_at_deletion,
+      anchoring_methods
+    ) VALUES (
+      v_packet.packet_code,
+      v_packet.packet_hash,
+      (SELECT session_hash FROM sessions WHERE id = v_session_id),
+      v_packet.packet_data->>'pdf_hash',
+      v_packet.facility_id,
+      v_packet.generated_at,
+      NOW(),
+      v_policy.id,
+      v_policy.retention_months,
+      ARRAY['REGISTRY']  -- at least the daily digest
+    );
+
+    -- STEP C: Delete ALL detailed records for this session
+    -- Order matters: delete child records first
+    DELETE FROM session_context_events WHERE session_id = v_session_id;
+    DELETE FROM facility_claims WHERE session_id = v_session_id;
+    DELETE FROM session_events WHERE session_id = v_session_id;
+    DELETE FROM sessions WHERE id = v_session_id;
+    DELETE FROM evidence_packets WHERE id = v_packet.id;
+
+    -- STEP D: Audit log entry
+    INSERT INTO retention_audit_log (
+      operation_code, retention_policy_id, facility_id,
+      packet_count_deleted, event_count_deleted,
+      tombstone_count_created,
+      pre_operation_session_hash_chain, post_operation_tombstone_digest,
+      deleted_packet_codes, execution_duration_ms
+    ) VALUES (
+      v_operation_code, v_policy.id, v_packet.facility_id,
+      1, v_event_count, 1,
+      v_packet.packet_hash,
+      encode(sha256(convert_to(v_packet.packet_code || '::' || v_packet.packet_hash, 'UTF8')), 'hex'),
+      ARRAY[v_packet.packet_code],
+      EXTRACT(EPOCH FROM (NOW() - v_start_time))::INTEGER * 1000
+    );
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER
+   SET search_path = public;  -- prevent search_path injection
+
+-- Grant execute to system_lifecycle_worker ONLY
+REVOKE ALL ON FUNCTION retention_expiry_daily_tick() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION retention_expiry_daily_tick()
+  TO system_lifecycle_worker;
+3.2 — pg_cron Schedule
+-- Schedule the retention worker to run daily at 03:00 UTC
+-- (low-traffic period to minimize user impact)
+SELECT cron.schedule(
+  'retention-expiry-daily',
+  '0 3 * * *',  -- daily at 03:00 UTC
+  $$ SELECT retention_expiry_daily_tick(); $$
+);
+🪦 THE TOMBSTONE ORDERING IS CRITICAL
+The order of operations in the retention worker is NON-NEGOTIABLE:
+
+1. Create the tombstone FIRST (preserves hash).
+2. Delete detailed records AFTER the tombstone exists.
+3. Write audit log entry LAST.
+
+If this order is reversed — if detailed records are deleted before the tombstone is created — a system crash during the operation could result in PERMANENT LOSS of both content AND proof-of-existence. The tombstone-first pattern ensures that even catastrophic failure mid-operation leaves the hash intact.
+
+The entire loop body for each packet must run in a single transaction to ensure atomicity.
+
+
+SECTION 4 — HASH ANCHORING (Registry Digests)
+Hash anchoring ensures that packet hashes exist in independently-verifiable form OUTSIDE EvidenceLedger. Without anchoring, a party who only possesses an exported PDF cannot verify it against any external reference if EvidenceLedger is offline.
+4.1 — Daily Digest Generator
+CREATE OR REPLACE FUNCTION generate_daily_hash_digest()
+  RETURNS UUID AS $$
+DECLARE
+  v_period_start TIMESTAMPTZ;
+  v_period_end TIMESTAMPTZ;
+  v_digest_id UUID;
+  v_digest_code TEXT;
+  v_manifest JSONB;
+  v_merkle_root TEXT;
+  v_packet_count INTEGER;
+BEGIN
+  -- Period: yesterday 00:00 UTC to today 00:00 UTC
+  v_period_start := date_trunc('day', NOW() - INTERVAL '1 day');
+  v_period_end := date_trunc('day', NOW());
+  v_digest_code := 'DIGEST-' || to_char(v_period_start, 'YYYY-MM-DD');
+
+  -- Skip if already exists
+  IF EXISTS (SELECT 1 FROM hash_registry_digests WHERE digest_code = v_digest_code)
+  THEN RETURN NULL; END IF;
+
+  -- Build manifest of all packets generated in the period
+  SELECT
+    jsonb_agg(
+      jsonb_build_object(
+        'packet_code', packet_code,
+        'packet_hash', packet_hash,
+        'generated_at', generated_at
+      ) ORDER BY generated_at
+    ),
+    COUNT(*)
+  INTO v_manifest, v_packet_count
+  FROM evidence_packets
+  WHERE generated_at >= v_period_start AND generated_at < v_period_end;
+
+  IF v_packet_count = 0 THEN
+    v_manifest := '[]'::jsonb;
+  END IF;
+
+  -- Compute Merkle root (simplified: hash of concatenated sorted hashes)
+  -- For production, use a true Merkle tree library; this is placeholder
+  SELECT encode(
+    sha256(convert_to(
+      coalesce(string_agg(elem->>'packet_hash', ':' ORDER BY elem->>'packet_hash'), ''),
+      'UTF8')),
+    'hex')
+  INTO v_merkle_root
+  FROM jsonb_array_elements(v_manifest) elem;
+
+  INSERT INTO hash_registry_digests (
+    digest_code, period_start, period_end, packet_count,
+    merkle_root, hash_manifest, digest_hash
+  ) VALUES (
+    v_digest_code, v_period_start, v_period_end, v_packet_count,
+    v_merkle_root, v_manifest,
+    encode(sha256(convert_to(
+      v_digest_code || '::' || v_merkle_root || '::' || v_packet_count::text,
+      'UTF8')), 'hex')
+  )
+  RETURNING id INTO v_digest_id;
+
+  RETURN v_digest_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Schedule: daily at 01:00 UTC (2 hours before retention expiry,
+-- so packets about to expire are safely digested first)
+SELECT cron.schedule(
+  'daily-hash-digest',
+  '0 1 * * *',
+  $$ SELECT generate_daily_hash_digest(); $$
+);
+4.2 — Edge Function: publish-digest-to-storage
+After a digest row is created, an Edge Function publishes it as a static JSON file to Supabase Storage (or equivalent public object store). The URL becomes the permanent external anchor.
+FUNCTION: publish-digest-to-storage
+TRIGGERED BY: A database trigger on hash_registry_digests INSERT, or
+              scheduled via pg_cron 10 minutes after digest generation
+
+STEP 1 — Load the latest unpublished digest
+STEP 2 — Serialize to canonical JSON:
+  {
+    "digest_code": "DIGEST-2025-01-15",
+    "period_start": "2025-01-14T00:00:00Z",
+    "period_end":   "2025-01-15T00:00:00Z",
+    "packet_count": 47,
+    "merkle_root":  "a3f...",
+    "hash_manifest": [ ... ],
+    "digest_hash":  "9e1...",
+    "produced_at":  "2025-01-15T01:00:00Z",
+    "produced_by":  "EvidenceLedger",
+    "verification_instructions":
+      "Compute SHA-256 of any Evidence Packet's packet_hash and locate it
+       in hash_manifest. Presence confirms existence as of period_end."
+  }
+STEP 3 — Upload to /digests/DIGEST-2025-01-15.json (public bucket)
+STEP 4 — Update hash_registry_digests:
+  UPDATE hash_registry_digests SET
+    published_at = NOW(),
+    public_url = 'https://[STORAGE_DOMAIN]/digests/DIGEST-2025-01-15.json'
+  WHERE id = [digest_id];
+  (This UPDATE is permitted only via SECURITY DEFINER function.)
+🔒 WHY DAILY DIGESTS BEAT PER-PACKET ANCHORING
+Publishing every packet hash individually would create scaling problems and provide no better cryptographic guarantee. A daily digest with Merkle root provides:
+
+• Constant-cost anchoring regardless of packet volume
+• Compact external reference (one URL per day, not one per packet)
+• Cryptographic proof of inclusion via Merkle path (future extension)
+• Natural batching for any optional blockchain anchoring
+
+Daily granularity means a packet generated at 23:59 may wait 1-25 hours to be anchored. This is acceptable: the retention window is measured in months, so a one-day lag is negligible.
+
+
+SECTION 5 — EVIDENCE PACKET EXPORT (Self-Contained PDF)
+Per DOCTRINE-030, the exported PDF is the AUTHORITATIVE content carrier after retention expiry. It must be self-contained, cryptographically verifiable without network access, and usable by anyone with basic SHA-256 tooling.
+5.1 — PDF Structure (Complete Specification)
+The PDF generator (which exists in skeletal form from Part #1) must produce a document containing:
+•	Cover Page: EvidenceLedger logo, Packet ID, Session ID, Facility name, ‘Generated at’ timestamp, and a prominent verification banner with the packet_hash in large monospace type.
+•	All Evidence Packet Sections 1–9 (or 1–10 if related sessions exist per Part #4): Exhibit Identification, Actor Authority, Event Record, System Actions, Current Session State, Evidentiary Scope & Limitations, Verification Statement, Contextual Delay Events (from Part #3), Session Closure Declaration (from Part #4), Related Sessions (if applicable, from Part #4), Evidentiary Summary.
+•	Verification Instructions Page: embedded instructions for verifying the PDF’s integrity using open-source tools. Must include: the packet_hash, the session_hash, the pdf_hash (self-referential — hash of the PDF excluding this field, computed via a canonical method), step-by-step verification procedure, and fallback URLs for the daily digest anchor.
+•	QR Code: encoding the packet_hash and verification URL, for quick scanning by external verifiers.
+•	Metadata Footer on every page: Packet ID, page number, hash truncated to first 16 chars (for visual identity check between pages).
+5.2 — Verification Instructions (Embedded in PDF)
+This text must appear on the Verification Instructions page of every exported PDF:
+VERIFICATION INSTRUCTIONS
+
+This document can be cryptographically verified with or without access to
+EvidenceLedger. Both verification paths are described below.
+
+--- PATH A: INDEPENDENT VERIFICATION (Platform Absent) ---
+
+You will need: this PDF, standard SHA-256 tooling, internet access to the
+daily hash digest (or a local copy you obtained previously).
+
+Step 1 — Compute the PDF's hash.
+  Linux/macOS:  sha256sum evidence_packet.pdf
+  Windows:      certutil -hashfile evidence_packet.pdf SHA256
+
+Step 2 — Confirm the output matches:
+  PDF_HASH: [EMBEDDED_PDF_HASH]
+
+Step 3 — Locate the daily digest for this packet’s period:
+  DIGEST_URL: [EMBEDDED_DIGEST_URL]
+
+Step 4 — Open the digest JSON and find the entry where
+  packet_hash equals: [EMBEDDED_PACKET_HASH]
+
+Step 5 — If found AND step 2 matched, this PDF is cryptographically
+  verified as unchanged since [GENERATION_DATE].
+
+--- PATH B: PLATFORM VERIFICATION (If Available) ---
+
+Visit: [VERIFICATION_URL]
+Paste the packet hash into the verification form.
+The system will return: MATCH or NO_MATCH.
+
+--- TRUST NOTICE ---
+
+Path A requires NO trust in EvidenceLedger. It relies only on:
+  (1) the SHA-256 algorithm (public standard)
+  (2) the PDF in your possession
+  (3) the daily digest, which you may have copied at any prior date
+
+If EvidenceLedger is offline, discontinued, or compromised, Path A still works.
+This is intentional: the evidence is designed to outlive the platform.
+5.3 — Updated Edge Function: export-evidence-packet
+INPUT: { packet_code: string, include_qr: boolean }
+
+STEP 1 — AUTH (admin role required)
+
+STEP 2 — Load the evidence packet
+  - If not found in evidence_packets: check evidence_tombstones
+  - If only tombstone exists: return error. Content is gone.
+
+STEP 3 — Verify at least one anchoring method is active for this packet
+  - REQUIRED: the packet's generation date must fall within a published
+    hash_registry_digest, OR the packet must be anchored externally
+  - If not yet anchored (e.g., generated today, digest not yet produced):
+    warn the user: 'This packet has not yet been anchored in a daily digest.
+     Export is permitted, but external verification requires the digest
+     produced on [tomorrow].' Include digest_code in the export.
+
+STEP 4 — Render PDF with embedded verification instructions
+  - Insert: PACKET_HASH, SESSION_HASH, GENERATION_DATE, DIGEST_URL,
+    VERIFICATION_URL, QR_CODE (if requested)
+  - Use a deterministic renderer (same input → byte-identical output)
+
+STEP 5 — Compute PDF_HASH (canonical)
+  - The PDF contains a self-referential field where its own hash appears.
+  - To handle this: render PDF with placeholder '{{PDF_HASH}}', compute hash
+    of that intermediate PDF, then perform in-place byte replacement of
+    the placeholder with the hash value. The canonical PDF_HASH is the
+    hash of the intermediate PDF (BEFORE the placeholder is replaced).
+  - This resolves the self-reference paradox.
+
+STEP 6 — Update evidence_packets metadata
+  UPDATE evidence_packets SET
+    last_exported_at = NOW(),
+    export_count = export_count + 1
+  WHERE packet_code = [input];
+  -- This UPDATE is the ONE permitted column mutation on evidence_packets,
+  -- via SECURITY DEFINER function. Content columns remain immutable.
+
+STEP 7 — Return PDF bytes + metadata
+  { pdf_bytes: [Buffer], pdf_hash: '...', packet_hash: '...',
+    digest_url: '...', exported_at: '...' }
+ℹ THE PDF HASH SELF-REFERENCE PROBLEM
+A PDF cannot contain its own hash without the hash changing when the hash is inserted. The standard solution (used here) is:
+
+1. Render PDF with a placeholder string (e.g., 32 spaces where the hash would go).
+2. Compute SHA-256 of this ‘pre-insertion’ PDF. Call this CANONICAL_HASH.
+3. Byte-replace the placeholder with CANONICAL_HASH in the PDF.
+4. The PDF now contains its own CANONICAL_HASH.
+5. Verifiers are instructed: ‘To verify, replace the hash field with 32 spaces, then compute SHA-256. Compare to the hash printed in the PDF.’
+
+This is slightly more complex than naive hashing but is the ONLY way to produce a self-verifying PDF. Implement it carefully and test thoroughly.
+
+
+SECTION 6 — VERIFICATION PORTAL UPDATES
+The public verification portal (Part #1) must be extended to handle three distinct verification scenarios based on what EvidenceLedger knows about the submitted hash.
+6.1 — Verification Logic Tree
+INPUT: hash (64-char hex SHA-256)
+
+STEP 1 — Look up in evidence_packets
+  IF FOUND:
+    Status: 'VERIFIED_ACTIVE'
+    Message: 'This hash corresponds to an active evidence packet.
+             The packet has not yet reached retention expiry.
+             Integrity verified.'
+    Actions: [Show packet details] [Export PDF] [View verification URL]
+    RETURN
+
+STEP 2 — Look up in evidence_tombstones
+  IF FOUND:
+    Status: 'VERIFIED_TOMBSTONED'
+    Message: 'This hash corresponds to an evidence packet that previously
+             existed in our system. Detailed records for this packet
+             were permanently deleted on [retention_expired_at] per the
+             retention policy in effect at that time.
+             The hash match confirms the packet existed, unchanged,
+             prior to deletion. No further content is available.'
+    Actions: [View tombstone metadata] [Download tombstone record]
+    RETURN
+
+STEP 3 — Look up in hash_registry_digests.hash_manifest
+  IF FOUND:
+    Status: 'VERIFIED_VIA_DIGEST'
+    Message: 'This hash appears in the daily hash digest for
+             [digest_period]. This confirms the packet existed as of
+             the end of that period. The packet may or may not still
+             be retained in our system.'
+    Actions: [View digest entry] [Download digest JSON]
+    RETURN
+
+STEP 4 — NOT FOUND
+  Status: 'UNVERIFIED'
+  Message: 'This hash is not recognized. Possible explanations:
+           (1) The hash was never registered with EvidenceLedger.
+           (2) The document associated with this hash has been
+               modified since its creation.
+           (3) The hash was registered in a digest not yet published.
+           We cannot confirm the authenticity of this document.'
+  Actions: [Report issue] [Try another hash]
+6.2 — Post-Expiry Verification UI
+The VERIFIED_TOMBSTONED state is visually distinct from VERIFIED_ACTIVE:
+•	Badge color: slate gray (indicating ‘archived’) instead of green.
+•	Icon: a tombstone/archive icon, not a checkmark.
+•	The UI prominently displays: ‘This evidence existed in our system and was not altered. Content has been deleted per retention policy. The PDF in your possession remains the authoritative record.’
+•	No ‘view packet’ option — there is nothing to view.
+6.3 — Public Digest Registry Page
+Add a new public route: /registry/digests
+•	Lists all published hash digest files with their period, packet count, and download link.
+•	Each row has a JSON download button.
+•	No authentication required.
+•	Helps third parties obtain and archive digests locally for platform-absent verification.
+
+SECTION 7 — RETENTION POLICY CONFIGURATION UI
+Admin-only settings panel for configuring facility retention policies. Add this as a new sub-section within the Facility Dashboard’s ‘Session Rules’ tab (from Part #4) or as a new ‘Retention’ tab.
+7.1 — Retention Policy Form
+// Component: RetentionPolicyForm
+// Access: admin role only
+
+// Fields:
+//   'Retention period (months):' range slider, 6 to 120, default 12
+//   Display helpers: shows human-readable equivalents
+//     '6 months', '1 year', '18 months', '2 years', ... '10 years'
+//
+//   'Configuration reason (optional):' textarea (max 500 chars)
+//     'e.g., Contract renewal requires 24-month retention'
+
+// Warning banner (always visible):
+//   "Changing the retention period creates a new policy version. The
+//    previous policy is preserved in the audit trail.
+//    Packets already generated under the prior policy retain their
+//    original expiry schedule — this change affects FUTURE packets only."
+
+// Confirmation modal before submit:
+//   'Confirm retention policy change to [X] months. This action:
+//    - Creates a new policy version
+//    - Supersedes the current active policy
+//    - Does NOT alter the expiry of existing evidence packets
+//    - Is permanent and auditable.'
+7.2 — Retention Audit Log View (Admin Only)
+// Component: RetentionAuditLogView
+// Shows rows from retention_audit_log filtered by current facility
+// Columns: operation_code, executed_at, packet_count_deleted,
+//          event_count_deleted, retention_policy_id (linked)
+// Expandable detail row: shows deleted_packet_codes list,
+//   pre_operation_session_hash_chain, post_operation_tombstone_digest
+// Export: 'Download as CSV' for compliance reporting
+7.3 — Tombstone Browser (Read-Only)
+// Component: TombstoneBrowser
+// Access: admin role
+// Lists evidence_tombstones filtered by current facility
+// Columns: packet_code, original_created_at, retention_expired_at,
+//          retention_months_at_deletion, anchoring_methods
+// Purpose: Admin can see what has been tombstoned, confirm deletion
+//          completed correctly, and verify anchoring is in place.
+// No 'restore' or 'recover' actions exist — tombstones are permanent.
+
+SECTION 8 — DESIGN SYSTEM & COMPONENT ADDITIONS
+8.1 — New Design Tokens
+--color-slate:       #34495E   // Retention, archive, tombstone states
+--color-slate-light: #D5D8DC   // Tombstone backgrounds
+8.2 — RetentionBadge Component
+// Visual indicator on evidence packets showing retention status
+// Variants:
+//   ACTIVE:       green, 'Active — expires [DATE]'
+//   WARNING:      amber, 'Expires in [N] days'
+//   EXPIRING_SOON: red, 'Expires in [N] hours'
+//   TOMBSTONED:   slate, 'Tombstoned — hash only'
+// Threshold for WARNING: 30 days before expiry
+// Threshold for EXPIRING_SOON: 48 hours before expiry
+8.3 — TombstoneCard Component
+// Visual representation of a tombstoned evidence packet
+// Layout: card with slate-gray accent, archive icon prominent
+// Content (ALL that is displayed):
+//   Packet Code: EP-...
+//   Original Created: [date]
+//   Tombstoned: [date]
+//   Retention Policy: [N] months
+//   Packet Hash: [full hash, copyable]
+//   Session Hash: [full hash, copyable]
+//   Anchoring: [methods list]
+//   Notice: 'Content permanently deleted. Hash verification only.'
+// No actions that could imply content recovery.
+8.4 — HashVerificationWidget (Public Portal)
+// Standalone hash verification tool for the public portal
+// Large input field for 64-char hex hash with format validation
+// 'Verify Hash' button
+// Result display handles all 4 states from Section 6.1
+// Each result state has distinct visual treatment
+// Copy-to-clipboard on all hash displays
+// 'Download verification record' button (produces signed JSON
+//  with the verification result, for audit trails)
+
+SECTION 9 — FILE STRUCTURE (Part #5 Additions)
+// NEW files added in Part #5:
+
+src/components/facility/
+  ├── RetentionPolicyForm.tsx
+  ├── RetentionAuditLogView.tsx
+  ├── TombstoneBrowser.tsx
+  └── RetentionBadge.tsx
+
+src/components/verify/
+  ├── HashVerificationWidget.tsx
+  ├── TombstoneCard.tsx
+  ├── DigestRegistryView.tsx
+  └── VerificationInstructionsPage.tsx  // Standalone info page
+
+src/lib/
+  ├── pdf-canonical-renderer.ts         // Self-referential PDF hashing
+  ├── digest-verification.ts            // Client-side digest parsing
+  └── retention-utils.ts                // Date math for expiry
+
+supabase/migrations/
+  └── 005_retention_and_tombstones.sql
+
+supabase/functions/
+  ├── export-evidence-packet/           // Produces self-contained PDF
+  │   └── index.ts
+  ├── publish-digest-to-storage/        // Uploads digest JSON to public bucket
+  │   └── index.ts
+  ├── configure-retention-policy/       // Admin config endpoint
+  │   └── index.ts
+  └── verify-hash-public/                // Public hash verification API
+      └── index.ts
+
+// UPDATED files:
+src/components/verify/VerificationPortal.tsx  // Handles 4 result states
+src/components/facility/EvidencePacketViewer.tsx  // Shows RetentionBadge
+
+SECTION 10 — DELIVERABLES CHECKLIST
+#	Deliverable	Doctrines	Type
+1	Migration SQL: 005_retention_and_tombstones.sql (retention_policies, evidence_tombstones, hash_registry_digests, retention_audit_log, evidence_packets extensions, RLS, REVOKE grants, verification queries)	001,004,005,028-032	NEW
+2	DB Function: retention_expiry_daily_tick() (SECURITY DEFINER, tombstone-first pattern, atomic per-packet transaction)	005,028-030	NEW
+3	DB Function: generate_daily_hash_digest() (Merkle root, manifest assembly, publication metadata)	029,031	NEW
+4	pg_cron schedules: retention-expiry-daily (03:00 UTC), daily-hash-digest (01:00 UTC)	028,031	NEW
+5	Edge Function: publish-digest-to-storage (uploads JSON to public storage, updates digest URL)	031,033	NEW
+6	Edge Function: export-evidence-packet EXTENDED (self-contained PDF, canonical hash, QR code, verification instructions embedded)	030,033	EXTENDED
+7	Edge Function: configure-retention-policy (admin auth, policy versioning, supersede mechanism)	001,004,028	NEW
+8	Edge Function: verify-hash-public EXTENDED (4-state logic: ACTIVE/TOMBSTONED/DIGEST/UNVERIFIED)	029,032	EXTENDED
+9	PDF Renderer: pdf-canonical-renderer.ts (self-referential hash, placeholder-replacement pattern)	030	NEW
+10	React: RetentionPolicyForm (admin config, versioning warning, confirmation modal)	028	NEW
+11	React: RetentionAuditLogView (compliance audit trail display)	028	NEW
+12	React: TombstoneBrowser (admin view of tombstoned packets, no recovery actions)	028,029	NEW
+13	React: RetentionBadge (ACTIVE/WARNING/EXPIRING_SOON/TOMBSTONED variants)	028	NEW
+14	React: HashVerificationWidget (public portal, 4-state result display)	032,033	NEW
+15	React: TombstoneCard (tombstoned packet display with no content, hash only)	029,030	NEW
+16	React: DigestRegistryView (public list of published digests with download)	031,033	NEW
+17	React: VerificationInstructionsPage (standalone info page explaining platform-absent verification)	033	NEW
+18	VerificationPortal EXTENDED to route between 4 states and render appropriate components	032	EXTENDED
+19	EvidencePacketViewer EXTENDED with RetentionBadge display	028	EXTENDED
+20	Design Tokens: --color-slate and --color-slate-light added	Consistency	EXTENDED
+21	TypeScript types: RetentionPolicy, EvidenceTombstone, HashRegistryDigest, VerificationState enum, RetentionAuditEntry	Type safety	EXTENDED
+22	Utility: retention-utils.ts (expiry date calculation, days-until-expiry, warning thresholds)	Computation	NEW
+23	Utility: digest-verification.ts (client-side JSON parsing, hash lookup in manifest, Merkle verification placeholder)	031,033	NEW
+
+⚠ FINAL DOCTRINE GATE — PART #5
+Before presenting any code, run this mental checklist:
+(1) Does the retention worker delete content BEFORE creating the tombstone? If yes → SEVERE VIOLATION of the tombstone ordering principle. FIX IMMEDIATELY.
+(2) Can a human role — even an admin — trigger retention expiry manually? If yes → FIX. (DOCTRINE-005 and 028: system_lifecycle_worker only)
+(3) Can a human role restore, recover, or undelete tombstoned content? If yes → CATASTROPHIC VIOLATION. No mechanism may exist. (DOCTRINE-028 non-reversibility)
+(4) Does the tombstone table preserve any content beyond hashes and minimal metadata? If yes → FIX. (DOCTRINE-029: no event content, no timestamps beyond tombstone, no actors)
+(5) Can verification WORK after retention expiry without any EvidenceLedger contact? If no → FIX. Path A must work with only PDF + digest + SHA-256. (DOCTRINE-033)
+(6) Does the exported PDF include embedded verification instructions? If no → FIX. (DOCTRINE-030)
+(7) Is the PDF’s self-hash computed via the placeholder-replacement pattern correctly? If implemented naively (hashing PDF containing its own hash), verification will be broken. Test rigorously.
+(8) Does any API accept a request to ‘restore’ or ‘recover’ tombstoned content? If yes → REMOVE. No such endpoint exists.
+(9) Does the system claim to provide CONTENT after tombstoning? If yes → FIX. Only hash lookup is possible. (DOCTRINE-032)
+(10) Is pg_cron configured for BOTH daily-hash-digest (01:00 UTC) and retention-expiry-daily (03:00 UTC)? If no → FIX. The 2-hour gap ensures packets are anchored before expiry.
+
+
+END OF PROMPT — PART #5: DATA RETENTION & POST-PLATFORM LIFE
+This prompt, when given to a capable LLM with Parts #1 through #4 in context, should produce the complete, doctrine-compliant retention and post-platform life module. The six new doctrines (028–033) codify the system’s ultimate design principle: EvidenceLedger is most valuable when it is least necessary. By ensuring that exported Evidence Packets can be independently verified using only SHA-256 tooling and publicly published hash digests, the system achieves what most platforms never do — it designs itself out of the trust chain. A court in 2040 evaluating a PDF from 2025 will verify it the same way whether EvidenceLedger still exists or not. That is the point.
+With Part #5 complete, EvidenceLedger is a finished system: it records evidence immutably (Parts #1–4), preserves proof indefinitely (Part #5), and empowers third parties to verify everything without requiring any trust in or access to the platform itself.
