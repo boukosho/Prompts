@@ -1,0 +1,433 @@
+SECTION 1 — IDENTITY, ROLE & DOCTRINE
+1.1 — Your Role
+You are a senior full-stack engineer continuing to build the EvidenceLedger system. You have completed Part #1 (Session Initiation: QR scanning, driver check-in/check-out, receipts, annotations, hash chain, verification portal) and Part #2 (Facility Operations: PAPERWORK_READY, driver disagreement/conflict preservation, manual session close, facility dashboard, team management). You are now building Part #3: Contextual Delay Events.
+There is NO Part #3 ‘Exclusion Rule Engine.’ That module was permanently removed before implementation due to doctrinal conflict. If you have any prior context referencing exclusion rules, adjusted dwell time, or dual-display dwell time — IGNORE IT COMPLETELY. It does not exist. EvidenceLedger does not compute.
+1.2 — Complete Doctrine Set (22 Active Doctrines)
+All 13 doctrines from Parts #1 and #2 remain in full force (001–013). Doctrines 014–018 are permanently retired and reserved. The four new doctrines for Part #3 are:
+DOCTRINE-019: CONTEXT EVENTS ARE NON-DETERMINATIVE
+  A CONTEXT_EVENT records a claim of operational circumstance.
+  It does NOT:
+    - Start or stop any clock (detention, dwell, or otherwise)
+    - Trigger any system action, state transition, or computation
+    - Override, modify, or interact with any other event type
+    - Assign fault, liability, or responsibility
+    - Validate the factual accuracy of the claimed circumstance
+  It EXISTS solely to provide operational context for reviewers.
+
+DOCTRINE-020: CONTROLLED VOCABULARY ENFORCEMENT
+  Context event labels MUST be selected from a fixed taxonomy:
+    YARD_CONGESTION, EQUIPMENT_BREAKDOWN, DOCK_UNAVAILABLE,
+    SAFETY_HOLD, REGULATORY_INSPECTION, WEATHER_INTERRUPT,
+    POWER_OR_UTILITY_OUTAGE, SHIFT_CHANGE_DELAY
+  No free-text labels. Taxonomy expansion requires a system migration.
+
+DOCTRINE-021: CONTEXT EVENTS DO NOT TRIGGER DISAGREEMENT FLAGS
+  Context events are NOT disputable via the driver disagreement mechanism.
+  Drivers may add general DRIVER_NOTE annotations but these are NOT linked
+  to context events via referenced_event_id.
+
+DOCTRINE-022: EVIDENCELEDGER DOES NOT COMPUTE (CAPSTONE)
+  The system records facts, declarations, and context. It does NOT calculate
+  dwell time adjustments, detention, demurrage, billing, or any derived metric.
+  All policy-based calculations are the responsibility of external systems
+  consuming EvidenceLedger’s tamper-proof data as input.
+⚠ LLM INSTRUCTION
+DOCTRINE-022 is absolute. If you find yourself writing any function, trigger, view, or component that COMPUTES a derived value (adjusted time, billing amount, detention duration, deducted minutes) — STOP. You are violating the system’s core identity. EvidenceLedger records. External systems compute.
+
+
+SECTION 2 — SCHEMA EXTENSIONS (MIGRATION 003)
+Generate a NEW Supabase migration file (003_contextual_delay_events.sql). This migration is minimal — context events use the EXISTING session_events table. The schema changes are: extending the event_type constraint, adding the taxonomy reference table, and adding a projection table.
+2.1 — Extend session_events: Add CONTEXT_EVENT Type
+ALTER TABLE session_events DROP CONSTRAINT session_events_event_type_check;
+ALTER TABLE session_events ADD CONSTRAINT session_events_event_type_check
+  CHECK (event_type IN (
+    'CHECK_IN', 'CHECK_OUT', 'FACILITY_CLAIM', 'DRIVER_NOTE',
+    'SESSION_CLOSE', 'SESSION_TIMEOUT', 'PAPERWORK_READY',
+    'FACILITY_NOTE', 'MANUAL_CLOSE',
+    'CONTEXT_EVENT'   -- NEW in Part #3
+  ));
+2.2 — New Table: context_event_taxonomy
+System-managed reference table. Read-only for all application roles. The source of truth for valid context labels.
+CREATE TABLE context_event_taxonomy (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  label           TEXT UNIQUE NOT NULL,
+  display_name    TEXT NOT NULL,
+  description     TEXT NOT NULL,
+  icon_name       TEXT NOT NULL,
+  severity_tier   TEXT NOT NULL CHECK (severity_tier IN (
+                    'OPERATIONAL', 'SAFETY', 'EXTERNAL')),
+  sort_order      INTEGER NOT NULL,
+  is_active       BOOLEAN DEFAULT true,
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO context_event_taxonomy
+  (label, display_name, description, icon_name, severity_tier, sort_order)
+VALUES
+  ('YARD_CONGESTION',        'Yard Congestion',
+   'Facility yard is congested, limiting vehicle movement',
+   'TrafficCone', 'OPERATIONAL', 1),
+  ('EQUIPMENT_BREAKDOWN',     'Equipment Breakdown',
+   'Loading/unloading equipment is non-functional',
+   'Wrench', 'OPERATIONAL', 2),
+  ('DOCK_UNAVAILABLE',        'Dock Unavailable',
+   'Assigned dock is occupied or inaccessible',
+   'DoorClosed', 'OPERATIONAL', 3),
+  ('SAFETY_HOLD',             'Safety Hold',
+   'Operations paused due to safety concern or protocol',
+   'ShieldAlert', 'SAFETY', 4),
+  ('REGULATORY_INSPECTION',   'Regulatory Inspection',
+   'Government or regulatory body inspection in progress',
+   'ClipboardCheck', 'EXTERNAL', 5),
+  ('WEATHER_INTERRUPT',       'Weather Interruption',
+   'Operations affected by adverse weather conditions',
+   'CloudRain', 'EXTERNAL', 6),
+  ('POWER_OR_UTILITY_OUTAGE', 'Power/Utility Outage',
+   'Power failure or utility disruption affecting operations',
+   'ZapOff', 'EXTERNAL', 7),
+  ('SHIFT_CHANGE_DELAY',      'Shift Change Delay',
+   'Delay caused by crew shift transition',
+   'Clock', 'OPERATIONAL', 8);
+
+REVOKE INSERT, UPDATE, DELETE ON context_event_taxonomy
+  FROM authenticated, anon;
+ALTER TABLE context_event_taxonomy ENABLE ROW LEVEL SECURITY;
+CREATE POLICY taxonomy_select ON context_event_taxonomy
+  FOR SELECT USING (true);
+2.3 — New Table: session_context_events (Read-Optimized Projection)
+CREATE TABLE session_context_events (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id      UUID REFERENCES sessions(id) NOT NULL,
+  event_id        UUID REFERENCES session_events(id) NOT NULL UNIQUE,
+  facility_id     UUID REFERENCES facilities(id) NOT NULL,
+  context_label   TEXT NOT NULL REFERENCES context_event_taxonomy(label),
+  severity_tier   TEXT NOT NULL,
+  declared_by_user UUID REFERENCES auth.users(id) NOT NULL,
+  timestamp_utc   TIMESTAMPTZ NOT NULL,
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+REVOKE UPDATE, DELETE ON session_context_events FROM authenticated, anon;
+ALTER TABLE session_context_events ENABLE ROW LEVEL SECURITY;
+CREATE POLICY sce_select ON session_context_events FOR SELECT
+  USING (facility_id IN (
+    SELECT facility_id FROM user_roles WHERE user_id = auth.uid()
+  ));
+2.4 — Trigger: Populate Projection Table
+CREATE OR REPLACE FUNCTION populate_context_event_projection()
+  RETURNS TRIGGER AS $$
+DECLARE
+  v_facility_id UUID;
+  v_severity TEXT;
+  v_label TEXT;
+  v_user_id UUID;
+BEGIN
+  IF NEW.event_type != 'CONTEXT_EVENT' THEN RETURN NEW; END IF;
+
+  v_label := NEW.raw_payload->>'context_label';
+  SELECT severity_tier INTO v_severity
+    FROM context_event_taxonomy WHERE label = v_label AND is_active = true;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Invalid context label: %', v_label;
+  END IF;
+
+  SELECT facility_id INTO v_facility_id FROM sessions WHERE id = NEW.session_id;
+  v_user_id := (NEW.raw_payload->>'declared_by_user_id')::UUID;
+
+  INSERT INTO session_context_events (
+    session_id, event_id, facility_id, context_label, severity_tier,
+    declared_by_user, timestamp_utc
+  ) VALUES (
+    NEW.session_id, NEW.id, v_facility_id, v_label, v_severity,
+    v_user_id, NEW.timestamp_utc
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER trg_populate_context_projection
+  AFTER INSERT ON session_events
+  FOR EACH ROW WHEN (NEW.event_type = 'CONTEXT_EVENT')
+  EXECUTE FUNCTION populate_context_event_projection();
+⚠ SCHEMA INVARIANT
+After generating migration 003, write verification queries proving:
+(1) CONTEXT_EVENT is accepted by session_events.event_type constraint.
+(2) context_event_taxonomy cannot be modified by application roles.
+(3) session_context_events cannot be UPDATED or DELETED by app roles.
+(4) The update_session_status trigger does NOT fire for CONTEXT_EVENT.
+(5) The flag_driver_disagreement trigger (Part #2) does NOT fire for CONTEXT_EVENT.
+(6) NO table named exclusion_rule_templates, session_exclusion_applications, or session_dwell_summary exists in the schema.
+
+
+SECTION 3 — EDGE FUNCTION: handle-context-event
+INPUT: {
+  session_code: string,
+  context_label: string,
+  // Auth: Supabase Auth JWT in Authorization header
+}
+
+STEP 1 — AUTHENTICATE & AUTHORIZE
+  - Extract user from Supabase Auth JWT
+  - Verify user has role = 'admin' or 'staff' for session’s facility
+  - If unauthorized → return 403
+
+STEP 2 — VALIDATE SESSION STATE
+  - Look up session by session_code
+  - If not found → return 404
+  - If session.status != 'OPEN' → return 409:
+    'Context events can only be recorded for active (OPEN) sessions.'
+
+STEP 3 — VALIDATE CONTEXT LABEL
+  - Query context_event_taxonomy WHERE label = input.context_label
+    AND is_active = true
+  - If not found → return 400: 'Invalid context label.'
+
+STEP 4 — RATE LIMIT CHECK
+  - Count CONTEXT_EVENT events for this session in the last 60 minutes
+  - If >= 5 → return 429: 'Rate limit exceeded. Max 5 context events per hour.'
+  - Context events CAN be recorded multiple times per session
+    (conditions change), but rate-limited against spam
+
+STEP 5 — GET PREVIOUS EVENT HASH
+  - Query most recent session_event, extract event_hash as prev_event_hash
+
+STEP 6 — RECORD THE EVENT
+  - Generate event_code
+  - Build payload:
+    {
+      event_type: 'CONTEXT_EVENT',
+      declared_by: 'FACILITY_USER',
+      session_id: session.id,
+      location_label: session.location_label,
+      connectivity: 'ONLINE',
+      annotation_text: null,  // NO free text
+      referenced_event_id: null,
+      receipt_issued: false,
+      raw_payload: {
+        context_label: input.context_label,
+        declared_by_user_id: auth.uid(),
+        severity_tier: taxonomy.severity_tier,
+        taxonomy_version: 1,
+      }
+    }
+  - Compute event_hash = SHA-256(canonical JSON + prev_event_hash)
+  - INSERT into session_events
+
+STEP 7 — UPDATE SESSION HASH CHAIN
+
+STEP 8 — RETURN CONFIRMATION
+  - Return {
+      success: true,
+      event_code: 'EVT-xxx',
+      event_type: 'CONTEXT_EVENT',
+      context_label: 'YARD_CONGESTION',
+      display_name: 'Yard Congestion',
+      severity_tier: 'OPERATIONAL',
+      recorded_at: '10:41:03 UTC',
+      session_status: 'OPEN',
+      message: 'Context event recorded. This event is informational
+               only and does not affect session state or any computation.'
+    }
+⚠ DOCTRINE-019/022 GATE CHECK
+After implementing this Edge Function, verify:
+(1) The function does NOT update sessions.status.
+(2) The function does NOT write to ANY table other than session_events.
+(3) The function does NOT trigger flag_driver_disagreement.
+(4) The function does NOT trigger update_session_status.
+(5) annotation_text is NULL — no free text. The label IS the content.
+(6) The function does NOT compute or return any duration, adjusted time, or billing value.
+
+
+SECTION 4 — FACILITY DASHBOARD UI
+4.1 — ‘Log Context’ Button
+In the Active Sessions view (Part #2), each OPEN session row gains a ‘Log Context’ action button alongside ‘Paperwork Ready’ and ‘Close Session.’
+// Style: indigo outline button (subordinate to Paperwork Ready)
+// Icon: Lucide 'MessageSquareWarning' (16px)
+// Label: 'Log Context'
+// Disabled if session is not OPEN
+// On click: opens ContextEventSelector popover
+4.2 — ContextEventSelector Component
+// Layout: popover with 2-column grid of selectable cards
+// Grouped by severity_tier with subtle group headers:
+//   OPERATIONAL: Yard Congestion, Equipment Breakdown, Dock Unavailable,
+//                Shift Change Delay
+//   SAFETY:      Safety Hold
+//   EXTERNAL:    Regulatory Inspection, Weather Interruption, Power/Utility Outage
+
+// Each card: [Lucide icon 24px] [display_name bold 14px] [description 12px gray]
+//   + severity badge (blue=OPERATIONAL, amber=SAFETY, gray=EXTERNAL)
+
+// On card click: confirmation toast (lightweight, NOT a full modal):
+//   'Record YARD_CONGESTION for session S-EGW09-...? This cannot be undone.'
+//   [Cancel] [Record]
+// On confirm: call handle-context-event Edge Function
+// On success: close popover, toast: '✓ Yard Congestion recorded at 10:41 UTC'
+// On 429 rate limit: toast: 'Too many context events. Please wait.'
+4.3 — Context Events in EventTimeline
+// CONTEXT_EVENT entry styling (distinct from all other event types):
+// Timeline node: indigo circle with context icon inside
+// Connector line: DASHED (not solid) — communicates 'informational'
+// Layout:
+//   CONTEXT: Yard Congestion           (bold, indigo)
+//   Recorded by: Facility Staff         (gray, small)
+//   10:41:03 UTC                        (monospace, gray)
+//   Severity: OPERATIONAL               (tier badge)
+//   Hash: 9c84f2...                     (truncated, expandable)
+
+// Color coding recap for EventTimeline nodes:
+//   CHECK_IN/CHECK_OUT: green
+//   PAPERWORK_READY: teal
+//   DRIVER_NOTE: gray
+//   MANUAL_CLOSE: navy
+//   CONTEXT_EVENT: indigo with DASHED connector
+4.4 — ContextSummaryStrip Component
+// Horizontal scrollable pill row at top of expanded session detail
+// Each pill: [icon] [label] [time] in indigo-outlined chip
+// If no context events: do not render the strip at all
+// If > 5: show first 4 + '+N more' overflow pill
+// Click pill: scroll EventTimeline to that event
+
+SECTION 5 — EVIDENCE PACKET: CONTEXTUAL DELAY EVENTS
+The evidence packet generator must be extended with a new section. Since the old Part #3 (Exclusion Rules) is removed, the evidence packet structure is:
+Section 1: Exhibit Identification          (Part #1)
+Section 2: Actor Authority Statement       (Part #1)
+Section 3: Event Record (Immutable)        (Part #1, extended in #2)
+Section 4: System Actions                  (Part #1)
+Section 5: Current Session State           (Part #1)
+Section 6: Evidentiary Scope and Limitations (Part #1, extended in #2)
+Section 7: Verification Statement          (Part #1)
+Section 8: Contextual Delay Event Record   (NEW — Part #3)
+Section 9: Evidentiary Summary             (Part #1, updated)
+5.1 — New Section 8: Contextual Delay Event Record
+## 8. Contextual Delay Event Record
+
+Classification: Non-determinative operational context
+Nature: Explanatory annotations recorded by facility staff
+System Posture: Neutral contextual recorder
+
+### 8.1 Contextual Events Recorded During This Session
+
+| # | Event ID | Label               | Severity    | Timestamp (UTC) | Captured By    |
+|---|----------|---------------------|-------------|-----------------|----------------|
+| 1 | EVT-002  | YARD_CONGESTION     | OPERATIONAL | 10:41:03        | Facility Staff |
+
+### 8.2 Event Characteristics
+  - Event is explicitly contextual, not declarative
+  - Event contains no detention start or end signal
+  - Event asserts operational condition only, not responsibility
+  - Label is selected from a fixed, predefined taxonomy
+  - No free-text narrative is attached
+
+### 8.3 System Behavior Declaration
+The system recorded the event immutably, preserved the timestamp and actor
+role, attached the context label, and maintained chronological order.
+The system did NOT: infer delay duration, calculate detention, assign fault,
+validate factual accuracy, or escalate consequences.
+
+### 8.4 Relationship to Detention and Liability
+Contextual events do not start detention clocks.
+Contextual events do not stop detention clocks.
+Contextual events do not override paperwork or gate events.
+Contextual events cannot be used alone to assert claims.
+They exist solely to provide operational context.
+
+### 8.5 Evidentiary Weight Statement
+These contextual events represent facility-declared claims of circumstance.
+They are preserved for reviewers (courts, lawyers, auditors, insurers).
+The system makes no determination about their accuracy or relevance.
+
+### 8.6 Integrity
+Each contextual event is append-only, cryptographically hashed, chain-linked,
+and visible regardless of later disputes or corrections.
+Any disagreement must be expressed through separate annotations or events.
+5.2 — Updated Section 9: Evidentiary Summary
+## 9. Evidentiary Summary (Plain Statement)
+
+On the recorded date and time, a driver checked in at [FACILITY] via QR scan
+and checked out at [TIME]. During the session, [CTX_COUNT] contextual event(s)
+were recorded by facility staff, indicating operational circumstances. These
+contextual events are informational only and did not affect any system
+computation or determination. The complete event record is cryptographically
+verified and independently auditable.
+
+SECTION 6 — SESSION HISTORY & REPORTING
+6.1 — Session History View Updates
+•	Each session row gains a ‘Context Events’ column showing a count badge (indigo background). Zero = nothing shown.
+•	Expanded detail shows ContextSummaryStrip above EventTimeline.
+•	Context events displayed in EventTimeline with indigo dashed-line styling.
+6.2 — CSV Export
+•	New column: context_event_count (integer). No context event details in CSV — full data available in evidence packets only.
+6.3 — New Filters
+•	‘Has Context Events’ toggle (Yes / No / All).
+•	‘Context Label’ multi-select dropdown (8 taxonomy values).
+6.4 — Session Duration Display (Simplified Without Exclusion Rules)
+The Session History view shows a single ‘Duration’ column: CHECK_OUT timestamp minus CHECK_IN timestamp, displayed as hours and minutes (e.g., ‘7h 28m’). This is pure arithmetic from recorded timestamps — NOT a system determination. No adjustments, no exclusions, no policy-based modifications. Per DOCTRINE-022, any deductions or adjustments are the responsibility of external systems.
+
+SECTION 7 — VERIFICATION PORTAL & DESIGN SYSTEM
+7.1 — Verification Portal Updates
+•	Context events appear in chronological list with indigo styling and ‘CONTEXT’ prefix.
+•	Marked as ‘Non-Determinative — Informational Only’ in verification view.
+•	Verification result includes: ‘This session contains [N] contextual event(s).’
+7.2 — New Design Tokens
+--color-indigo:       #2C3E80   // Context events: neutral, informational
+--color-indigo-light: #D6DBEF   // Context event backgrounds
+7.3 — New Components
+ContextLabelBadge: icon + label + severity dot in indigo-outlined chip
+SeverityTierIndicator: 8px colored dot + 11px label
+  OPERATIONAL = #2E75B6 (blue)
+  SAFETY      = #E67E22 (amber)
+  EXTERNAL    = #7F8C8D (gray)
+
+SECTION 8 — FILE STRUCTURE (Part #3 Additions)
+src/components/facility/
+  ├── ContextEventSelector.tsx
+  ├── ContextSummaryStrip.tsx
+  └── LogContextButton.tsx
+
+src/components/ui/
+  ├── ContextLabelBadge.tsx
+  └── SeverityTierIndicator.tsx
+
+src/lib/
+  └── context-taxonomy.ts
+
+supabase/migrations/
+  └── 003_contextual_delay_events.sql
+
+supabase/functions/
+  └── handle-context-event/
+      └── index.ts
+
+SECTION 9 — DELIVERABLES CHECKLIST
+#	Deliverable	Doctrines	Type
+1	Migration SQL: 003_contextual_delay_events.sql (event type extension, taxonomy table, projection table, trigger, RLS, REVOKE, verification queries)	001,019-022	NEW
+2	Edge Function: handle-context-event (auth, taxonomy validation, rate limit, hash chain, NO side effects, NO computation)	001,002,007,019-022	NEW
+3	React: ContextEventSelector (taxonomy grid popover, grouped by severity, confirmation toast)	020	NEW
+4	React: LogContextButton (indigo outline button, disabled when session not OPEN)	N/A (UI)	NEW
+5	React: ContextSummaryStrip (horizontal pill row with overflow)	N/A (UI)	NEW
+6	React: ContextLabelBadge (icon + label + severity)	020	NEW
+7	React: SeverityTierIndicator (colored dot)	N/A (UI)	NEW
+8	EventTimeline: EXTENDED for CONTEXT_EVENT (indigo node, dashed connector)	N/A (UI)	EXTENDED
+9	Evidence Packet: new Section 8 (Contextual Delay Event Record) with 6 sub-sections	019,021	EXTENDED
+10	Evidence Packet: updated Section 9 (Evidentiary Summary) mentioning context events	019	EXTENDED
+11	Session History: EXTENDED with context count column, filters, ContextSummaryStrip	N/A (UI)	EXTENDED
+12	CSV Export: EXTENDED with context_event_count column	N/A	EXTENDED
+13	Verification Portal: EXTENDED with context event display + non-determinative label	019	EXTENDED
+14	Design Tokens: --color-indigo, --color-indigo-light added	Consistency	EXTENDED
+15	TypeScript types: ContextEventTaxonomy, ContextEventPayload, SessionContextEvent, SeverityTier	Type safety	EXTENDED
+16	Utility: context-taxonomy.ts (fetch helper, types, label mapping)	020	NEW
+
+⚠ FINAL DOCTRINE GATE — PART #3
+Before presenting any code, run this mental checklist:
+(1) Does ANY trigger, function, or computation reference CONTEXT_EVENT as input to a calculation? If yes → SEVERE VIOLATION. (DOCTRINE-019/022)
+(2) Can a facility user enter free-text labels? If yes → FIX. (DOCTRINE-020)
+(3) Does CONTEXT_EVENT trigger flag_driver_disagreement? If yes → FIX. (DOCTRINE-021)
+(4) Does CONTEXT_EVENT change sessions.status? If yes → FIX. (DOCTRINE-013/019)
+(5) Does the evidence packet say context events ‘prove’ or ‘establish’ anything? If yes → FIX. (DOCTRINE-019)
+(6) Does ANY table named exclusion_rule_templates, session_exclusion_applications, or session_dwell_summary exist? If yes → REMOVE. (Exclusion engine is retired.)
+(7) Does ANY component compute or display ‘adjusted dwell time’? If yes → REMOVE. (DOCTRINE-022)
+(8) Can context_event_taxonomy be modified by any application role? If yes → FIX. (System-managed only.)
+
+
+END OF PROMPT — PART #3: CONTEXTUAL DELAY EVENTS
+This prompt, when given to a capable LLM with Parts #1 and #2 in context, should produce the complete, doctrine-compliant Contextual Delay Event module. DOCTRINE-022 (EvidenceLedger Does Not Compute) is the capstone doctrine of the entire system — the architectural lesson learned from the Exclusion Rule Engine’s removal. It ensures that EvidenceLedger’s value proposition is forever clear: tamper-proof evidence, neutral recording, zero inference. External systems compute. EvidenceLedger testifies.
